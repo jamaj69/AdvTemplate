@@ -19,6 +19,8 @@ message-passing protocol.
   to/from JSON, ensuring compatibility across all boundaries.
 - **Two-level coordination** — each top-level task can spawn and coordinate its
   own child tasks.
+- **Isolated event loops** — each coordinator runs in a dedicated thread with
+  its own `asyncio` loop, fully isolated from the main loop.
 - **Extensible** — add new tasks by subclassing the appropriate base class and
   overriding `run()`.
 
@@ -154,7 +156,7 @@ msg2 = Message.from_json(json_str)
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed description of
-the design, data flow diagrams, and extension guidelines.
+the design, isolated event loop model, data flow diagrams, and extension guidelines.
 
 ---
 

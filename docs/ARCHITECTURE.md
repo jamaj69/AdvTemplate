@@ -11,11 +11,16 @@ child tasks — creating a two-level (or deeper) coordination hierarchy.
 
 ## Execution Strategies
 
-| Strategy   | Base class                    | Queue type               | Scheduled via                              |
-|------------|-------------------------------|--------------------------|--------------------------------------------|
-| Coroutine  | `CoroutineCoordinationTask`   | `asyncio.Queue`          | `asyncio.create_task(task.run())`          |
-| Thread     | `ThreadCoordinationTask`      | `queue.Queue`            | `loop.run_in_executor(ThreadPoolExecutor)` |
-| Process    | `ProcessCoordinationTask`     | `multiprocessing.Queue`  | `loop.run_in_executor(ProcessPoolExecutor)`|
+| Strategy   | Base class                    | Queue type                        | Scheduled via                              |
+|------------|-------------------------------|-----------------------------------|-----------------------------------------|
+| Coroutine  | `CoroutineCoordinationTask`   | `asyncio.Queue`                   | `asyncio.create_task(task.run())`          |
+| Thread     | `ThreadCoordinationTask`      | `queue.Queue`                     | `loop.run_in_executor(ThreadPoolExecutor)` |
+| Process    | `ProcessCoordinationTask`     | `multiprocessing.Manager().Queue()` | `loop.run_in_executor(ProcessPoolExecutor)`|
+
+> **Process queue note:** Plain `multiprocessing.Queue` objects cannot be
+> pickled and therefore cannot be passed to a `ProcessPoolExecutor` worker.
+> `multiprocessing.Manager().Queue()` returns a picklable proxy backed by a
+> manager server process, solving the cross-process boundary problem.
 
 All three share the same public contract (see `BaseCoordinationTask`) and the
 same message envelope (`Message`).
@@ -96,6 +101,41 @@ and override `run()`. The following three methods are provided by
 `run()` is the task body:
 - For **coroutine** tasks: `async def run(self) -> None`
 - For **thread** and **process** tasks: `def run(self) -> None`
+
+---
+
+## Isolated Event Loop per Coordinator
+
+Each coordinator demo (`run_coroutine_demo`, `run_thread_demo`,
+`run_process_demo`) runs in **its own OS thread** with **its own
+`asyncio` event loop**, fully isolated from the main loop.
+
+This is achieved by `_run_in_isolated_loop()` in `main.py`:
+
+```python
+async def _run_in_isolated_loop(coro_fn) -> None:
+    t = threading.Thread(target=lambda: asyncio.run(coro_fn()), daemon=True)
+    t.start()
+    await asyncio.get_running_loop().run_in_executor(None, t.join)
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Main thread — main asyncio loop                                 │
+│                                                                 │
+│  await _run_in_isolated_loop(run_coroutine_demo)                │
+│        │                                                        │
+│        └─── run_in_executor(None, thread.join) ◄─────────────┐ │
+│                                                               │ │
+│  ┌────────────────────────────────────────────────────────┐  │ │
+│  │ Worker thread — isolated asyncio loop                  │  │ │
+│  │  asyncio.run(run_coroutine_demo())                     │──┘ │
+│  └────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The three demos run **sequentially** (each awaited to completion before the
+next starts), but each lives in its own isolated runtime context.
 
 ---
 
@@ -186,3 +226,5 @@ main.py  (logs / further processing)
 * **Serialisability** — all messages travel as JSON; no strategy requires shared memory.
 * **Separation of concerns** — `main.py` only schedules; tasks handle their own children.
 * **Extensibility** — add new strategies by subclassing `BaseCoordinationTask`.
+* **Loop isolation** — each coordinator runs in a dedicated thread+loop so they cannot interfere with the main loop.
+* **No log leakage** — task loggers set `propagate = False` to prevent duplicate log output across loop/thread boundaries.

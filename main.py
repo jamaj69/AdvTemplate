@@ -26,6 +26,8 @@ import asyncio
 import logging
 import multiprocessing
 import queue
+import threading
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from customtypes import (
@@ -159,6 +161,34 @@ async def run_process_demo() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Isolated-loop runner
+# ---------------------------------------------------------------------------
+
+async def _run_in_isolated_loop(coro_fn: Callable[[], Awaitable[None]]) -> None:
+    """
+    Run *coro_fn* in a brand-new ``asyncio`` event loop inside a dedicated
+    thread, keeping it fully isolated from the main loop.
+
+    The main loop awaits completion via ``run_in_executor`` so it remains
+    responsive while the worker thread runs.
+    """
+    exc: BaseException | None = None
+
+    def _thread() -> None:
+        nonlocal exc
+        try:
+            asyncio.run(coro_fn())
+        except BaseException as e:  # noqa: BLE001
+            exc = e
+
+    t = threading.Thread(target=_thread, daemon=True)
+    t.start()
+    await asyncio.get_running_loop().run_in_executor(None, t.join)
+    if exc is not None:
+        raise exc
+
+
+# ---------------------------------------------------------------------------
 # Main coroutine
 # ---------------------------------------------------------------------------
 
@@ -166,13 +196,14 @@ async def main() -> None:
     """
     Top-level async coordinator.
 
-    Runs all three demo modes sequentially.  In a real application you would
+    Each demo runs in its own thread with its own ``asyncio`` event loop,
+    fully isolated from the main loop.  In a real application you would
     replace this with your own scheduling logic — mixing modes as needed and
     wiring up queues between coordination layers.
     """
-    await run_coroutine_demo()
-    await run_thread_demo()
-    await run_process_demo()
+    await _run_in_isolated_loop(run_coroutine_demo)
+    await _run_in_isolated_loop(run_thread_demo)
+    await _run_in_isolated_loop(run_process_demo)
     logger.info("All coordination tasks completed.")
 
 
