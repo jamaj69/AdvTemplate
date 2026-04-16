@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 main.py
 =======
@@ -128,32 +129,33 @@ async def run_process_demo() -> None:
     """Schedule and run example process coordination tasks."""
     logger.info("=== Process mode ===")
 
-    inbox:  multiprocessing.Queue = multiprocessing.Queue()  # type: ignore[type-arg]
-    outbox: multiprocessing.Queue = multiprocessing.Queue()  # type: ignore[type-arg]
+    with multiprocessing.Manager() as manager:
+        inbox  = manager.Queue()
+        outbox = manager.Queue()
 
-    config = TaskConfig(
-        task_id="process-task-1",
-        kind=TaskKind.PROCESS,
-        inbox=inbox,
-        outbox=outbox,
-        log_level="DEBUG",
-    )
+        config = TaskConfig(
+            task_id="process-task-1",
+            kind=TaskKind.PROCESS,
+            inbox=inbox,
+            outbox=outbox,
+            log_level="DEBUG",
+        )
 
-    task = ExampleProcessTask(config)
+        task = ExampleProcessTask(config)
 
-    # Feed messages before starting
-    for i in range(3):
-        inbox.put(Message.data(sender="main", payload={"index": i}).to_json())
-    inbox.put(Message.control(sender="main", signal=ControlSignal.STOP).to_json())
+        # Feed messages before starting
+        for i in range(3):
+            inbox.put(Message.data(sender="main", payload={"index": i}).to_json())
+        inbox.put(Message.control(sender="main", signal=ControlSignal.STOP).to_json())
 
-    with ProcessPoolExecutor(max_workers=1) as executor:
-        await asyncio.get_running_loop().run_in_executor(executor, task.run)
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            await asyncio.get_running_loop().run_in_executor(executor, task.run)
 
-    # Drain outbox
-    while not outbox.empty():
-        raw = outbox.get_nowait()
-        reply = Message.from_json(raw) if isinstance(raw, str) else raw
-        logger.info("process result: %s", reply.payload)
+        # Drain outbox
+        while not outbox.empty():
+            raw = outbox.get_nowait()
+            reply = Message.from_json(raw) if isinstance(raw, str) else raw
+            logger.info("process result: %s", reply.payload)
 
 
 # ---------------------------------------------------------------------------

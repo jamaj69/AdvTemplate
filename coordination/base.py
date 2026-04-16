@@ -59,6 +59,7 @@ class BaseCoordinationTask(abc.ABC):
                 )
             )
             logger.addHandler(handler)
+        logger.propagate = False
         logger.setLevel(config.log_level)
         return logger
 
