@@ -1,28 +1,30 @@
 # AdvTemplate — Async Multi-Strategy Coordination System
 
 A Python project template for building **hierarchical async coordination
-systems** where a top-level `main.py` schedules coordination tasks that can
-themselves spawn and coordinate sub-tasks — all using a consistent, typed
-message-passing protocol.
+systems** where a top-level `main.py` feeds messages into typed coordination
+tasks, managed by a `SchedulerManager`, using a consistent message-passing
+protocol.
 
 ---
 
 ## Features
 
-- **Three execution strategies** for coordination tasks:
-  - Pure `asyncio` coroutines
-  - Worker threads (`ThreadPoolExecutor`)
-  - Separate OS processes (`ProcessPoolExecutor`)
-- **Uniform API** — every task exposes the same `log()`, `get_item()`, and
-  `put_item()` interface regardless of strategy.
+- **Three execution strategies**, each as a concrete `SchedulerTask` subclass:
+  - `SchedulerAsyncTask` — pure `asyncio` coroutines in an isolated loop
+  - `SchedulerThreadTask` — synchronous body in a `ThreadPoolExecutor`
+  - `SchedulerProcessTask` — synchronous body in a `ProcessPoolExecutor`
+- **Uniform API** — every task exposes `start()`, `run()`, `log()`,
+  `get_item()`, and `put_item()` regardless of strategy.
+- **Self-contained tasks** — each task owns its queues, executor, and
+  serialisation; `main.py` only feeds messages and reads `task.results`.
 - **Typed messages** — all communication uses `Message` dataclasses serialised
   to/from JSON, ensuring compatibility across all boundaries.
 - **Two-level coordination** — each top-level task can spawn and coordinate its
-  own child tasks.
-- **Isolated event loops** — each coordinator runs in a dedicated thread with
-  its own `asyncio` loop, fully isolated from the main loop.
-- **Extensible** — add new tasks by subclassing the appropriate base class and
-  overriding `run()`.
+  own child tasks internally.
+- **Isolated event loops** — `SchedulerAsyncTask` runs in a dedicated thread
+  with its own `asyncio` loop, fully isolated from the main loop.
+- **Extensible** — add new tasks by subclassing the appropriate scheduler class
+  and overriding `run()`.
 
 ---
 
@@ -49,16 +51,16 @@ Expected output:
 ```
 2026-04-16T12:00:00 [INFO] main: === Coroutine mode ===
 ...
-2026-04-16T12:00:00 [INFO] main: coroutine result: {'index': 0, 'doubled': 0}
+2026-04-16T12:00:00 [INFO] main: coroutine-task-1 result: {'index': 0, 'doubled': 0}
 ...
 2026-04-16T12:00:00 [INFO] main: === Thread mode ===
 ...
-2026-04-16T12:00:00 [INFO] main: thread result: {'index': 0, 'tripled': 0}
+2026-04-16T12:00:00 [INFO] main: thread-task-1 result: {'index': 0, 'tripled': 0}
 ...
 2026-04-16T12:00:00 [INFO] main: === Process mode ===
 ...
-2026-04-16T12:00:00 [INFO] main: process result: {'index': 0, 'squared': 0}
-2026-04-16T12:00:00 [INFO] main: All coordination tasks completed.
+2026-04-16T12:00:00 [INFO] main: process-task-1 result: {'index': 0, 'squared': 0}
+2026-04-16T12:00:00 [INFO] main: Manager 'demo-manager' status: done
 ```
 
 ---
@@ -67,17 +69,18 @@ Expected output:
 
 ```
 AdvTemplate/
-├── main.py                       # Async entry point
+├── main.py                       # Entry point; builds SchedulerManager, feeds messages
 ├── customtypes.py                # Shared types & message protocol
 ├── coordination/
-│   ├── base.py                   # Abstract base class
-│   ├── coroutine_task.py         # Coroutine strategy base
-│   ├── thread_task.py            # Thread strategy base
-│   └── process_task.py           # Process strategy base
+│   ├── base.py                   # BaseCoordinationTask (for internal child tasks)
+│   ├── coroutine_task.py         # CoroutineCoordinationTask (child tasks)
+│   ├── thread_task.py            # ThreadCoordinationTask   (child tasks)
+│   ├── process_task.py           # ProcessCoordinationTask  (child tasks)
+│   └── scheduler.py             # SchedulerTask ABC + subclasses + SchedulerManager
 ├── examples/
-│   ├── example_coroutine.py      # Coroutine task example
-│   ├── example_thread.py         # Thread task example
-│   └── example_process.py        # Process task example
+│   ├── example_coroutine.py      # ExampleCoroutineTask  ← SchedulerAsyncTask
+│   ├── example_thread.py         # ExampleThreadTask     ← SchedulerThreadTask
+│   └── example_process.py        # ExampleProcessTask    ← SchedulerProcessTask
 └── docs/
     └── ARCHITECTURE.md           # Full architecture documentation
 ```
@@ -86,48 +89,44 @@ AdvTemplate/
 
 ## How to Add a Custom Task
 
-1. Choose a strategy and subclass the corresponding base:
+1. Choose a strategy and subclass the corresponding scheduler class:
 
     ```python
     # my_task.py
-    from coordination.coroutine_task import CoroutineCoordinationTask
+    from coordination.scheduler import SchedulerAsyncTask
     from customtypes import Message
 
-    class MyTask(CoroutineCoordinationTask):
+    class MyTask(SchedulerAsyncTask):
         async def run(self) -> None:
             while True:
                 msg = await self.get_item()
                 if self._is_stop_signal(msg):
                     break
-                # process msg.payload …
                 await self.put_item(
-                    Message.result(self.task_id, {"status": "ok"})
+                    Message.result(sender=self.name, payload={"status": "ok"})
                 )
     ```
 
-2. Wire up queues and a `TaskConfig` in `main.py` or your own coordinator:
+2. Instantiate, pre-feed, and register with the manager:
 
     ```python
-    import asyncio
-    from customtypes import TaskConfig, TaskKind
+    from coordination.scheduler import SchedulerManager
+    from customtypes import ControlSignal, Message
 
-    inbox  = asyncio.Queue()
-    outbox = asyncio.Queue()
-    config = TaskConfig(
-        task_id="my-task",
-        kind=TaskKind.COROUTINE,
-        inbox=inbox,
-        outbox=outbox,
-    )
-    task = MyTask(config)
-    asyncio.create_task(task.run())
+    task = MyTask(name="my-task", log_level="DEBUG")
+    task.inbox.put_nowait(Message.data(sender="main", payload={"value": 42}))
+    task.inbox.put_nowait(Message.control(sender="main", signal=ControlSignal.STOP))
+
+    manager = SchedulerManager(name="my-manager")
+    manager.add(task)
+    await manager.run_all()
     ```
 
-3. Send messages to the task:
+3. Read results:
 
     ```python
-    from customtypes import Message
-    await inbox.put(Message.data(sender="main", payload={"value": 42}))
+    for msg in task.results:
+        print(msg.payload)
     ```
 
 ---
@@ -143,23 +142,24 @@ json_str = msg.to_json()
 msg2 = Message.from_json(json_str)
 ```
 
-| Field            | Type          | Description                         |
-|------------------|---------------|-------------------------------------|
+| Field            | Type          | Description                           |
+|------------------|---------------|---------------------------------------|
 | `kind`           | `MessageKind` | DATA / CONTROL / LOG / ERROR / RESULT |
-| `sender`         | `str`         | Originating task ID                 |
-| `payload`        | `Any`         | JSON-serialisable content           |
-| `correlation_id` | `str \| None` | Links requests to responses         |
-| `timestamp`      | `str`         | ISO-8601 UTC creation time          |
+| `sender`         | `str`         | Originating task name                 |
+| `payload`        | `Any`         | JSON-serialisable content             |
+| `correlation_id` | `str \| None` | Links requests to responses           |
+| `timestamp`      | `str`         | ISO-8601 UTC creation time            |
 
 ---
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed description of
-the design, isolated event loop model, data flow diagrams, and extension guidelines.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full class hierarchy,
+isolated event loop model, data flow diagrams, and extension guidelines.
 
 ---
 
 ## License
 
 MIT
+

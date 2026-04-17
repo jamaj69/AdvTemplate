@@ -3,17 +3,15 @@ examples/example_thread.py
 ===========================
 Example thread coordination task.
 
-Demonstrates the minimal pattern for a derived
-:class:`~coordination.thread_task.ThreadCoordinationTask`:
+Demonstrates the pattern for a :class:`~coordination.scheduler.SchedulerThreadTask`:
 
-* Override :meth:`run` as a **synchronous** method (runs in a thread).
-* Use ``self.get_item(timeout=…)`` to receive messages (returns ``None``
-  on timeout, allowing the stop event to be checked).
-* Use ``self.put_item(…)`` to send results.
-* Honour stop signals and ``self._stop_event``.
+* Subclass :class:`SchedulerThreadTask` and override ``def run()`` (synchronous).
+* Use ``self.get_item(timeout=…)`` / ``self.put_item(msg)`` for message I/O.
+* ``self.inbox`` and ``self.outbox`` are ``queue.Queue`` instances.
+* Poll ``self._stop_event`` to support cooperative cancellation.
 
-This task also spawns a child thread task in a :class:`~threading.Thread`
-to demonstrate the two-level coordination pattern.
+Child tasks still use :class:`~coordination.thread_task.ThreadCoordinationTask`
+as they are internal implementation details of the parent.
 """
 
 from __future__ import annotations
@@ -23,10 +21,11 @@ import threading
 
 from customtypes import ControlSignal, Message, TaskConfig, TaskKind
 from coordination.thread_task import ThreadCoordinationTask
+from coordination.scheduler import SchedulerThreadTask
 
 
 # ---------------------------------------------------------------------------
-# Child thread task (spawned by ExampleThreadTask)
+# Child thread task (internal — spawned by ExampleThreadTask)
 # ---------------------------------------------------------------------------
 
 class _ChildThreadTask(ThreadCoordinationTask):
@@ -60,33 +59,34 @@ class _ChildThreadTask(ThreadCoordinationTask):
 # Public example task
 # ---------------------------------------------------------------------------
 
-class ExampleThreadTask(ThreadCoordinationTask):
+class ExampleThreadTask(SchedulerThreadTask):
     """
-    Example top-level thread coordination task.
+    Example thread coordination task.
 
-    Spawns a :class:`_ChildThreadTask` in a dedicated :class:`threading.Thread`
-    and forwards incoming messages to it.  Results from the child are placed
-    on this task's outbox.
+    Spawns a :class:`_ChildThreadTask` in a dedicated :class:`threading.Thread`,
+    forwards every incoming DATA message to it, collects results, and places
+    them on its own outbox.  Stops cleanly when it receives a CONTROL/STOP signal.
     """
 
     def run(self) -> None:
         self.log("info", "ExampleThreadTask started")
 
-        # Internal queues for child communication
         child_inbox:  queue.Queue[Message] = queue.Queue()
         child_outbox: queue.Queue[Message] = queue.Queue()
 
         child_config = TaskConfig(
-            task_id=f"{self.task_id}.child",
+            task_id=f"{self.name}.child",
             kind=TaskKind.THREAD,
             inbox=child_inbox,
             outbox=child_outbox,
-            log_level=self._config.log_level,
+            log_level=self.log_level,
         )
         child = _ChildThreadTask(child_config)
-        child_thread = threading.Thread(target=child.run, name=child_config.task_id, daemon=True)
+        child_thread = threading.Thread(
+            target=child.run, name=child_config.task_id, daemon=True
+        )
         child_thread.start()
-        self.log("info", f"spawned child thread '{child_config.task_id}'")
+        self.log("info", "spawned child thread '%s'", child_config.task_id)
 
         while not self._stop_event.is_set():
             msg = self.get_item(timeout=0.5)
@@ -94,12 +94,12 @@ class ExampleThreadTask(ThreadCoordinationTask):
                 continue
             if self._is_stop_signal(msg):
                 self.log("info", "received stop — propagating to child")
-                child_inbox.put(Message.control(sender=self.task_id, signal=ControlSignal.STOP))
+                child_inbox.put(
+                    Message.control(sender=self.name, signal=ControlSignal.STOP)
+                )
                 child_thread.join(timeout=5.0)
                 break
-            # Forward to child
             child_inbox.put(msg)
-            # Collect child result (blocking wait)
             try:
                 result = child_outbox.get(timeout=5.0)
                 self.put_item(result)
