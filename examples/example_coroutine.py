@@ -1,17 +1,24 @@
 """
 examples/example_coroutine.py
 ==============================
-Example async coordination task.
+Example async coordination task demonstrating the pipeline + lifecycle pattern.
 
-Demonstrates the pattern for a :class:`~coordination.scheduler.SchedulerAsyncTask`:
-
+Key behaviours
+--------------
 * Subclass :class:`SchedulerAsyncTask` and override ``async def run()``.
-* Use ``await self.get_item()`` / ``await self.put_item(msg)`` for message I/O.
-* ``self.inbox`` and ``self.outbox`` are ``asyncio.Queue`` instances.
-* Honour stop signals via ``self._is_stop_signal(msg)``.
+* Queues (``inbox``, ``outbox``, ``log_queue``) are injected via the
+  constructor — the base class exposes them; ``run()`` never touches raw
+  queues directly.
+* ``get_item()`` returns any :class:`~customtypes.Message`, including
+  CONTROL signals.  The run loop dispatches on signal type:
 
-Child tasks still use :class:`~coordination.coroutine_task.CoroutineCoordinationTask`
-as they are internal implementation details of the parent.
+  - ``STOP``     → drain child, exit gracefully.
+  - ``SHUTDOWN`` → exit immediately.
+  - ``PAUSE``    → call ``await self._wait_for_resume()``.
+  - ``DATA``     → forward to child, collect result.
+
+Child tasks use :class:`~coordination.coroutine_task.CoroutineCoordinationTask`
+and are internal implementation details of the parent coordinator.
 """
 
 from __future__ import annotations
@@ -60,9 +67,22 @@ class ExampleCoroutineTask(SchedulerAsyncTask):
     """
     Example coroutine coordination task.
 
-    Spawns a :class:`_ChildCoroutineTask`, forwards every incoming DATA
-    message to it, collects results, and places them on its own outbox.
-    Stops cleanly when it receives a CONTROL/STOP signal.
+    Accepts injected ``inbox``, ``outbox`` and ``log_queue`` for pipeline
+    wiring.  Handles the full lifecycle: DATA processing, PAUSE/RESUME,
+    STOP and SHUTDOWN.
+
+    Parameters
+    ----------
+    name:
+        Task identifier.
+    log_level:
+        Logging verbosity.
+    inbox:
+        Input queue (``asyncio.Queue``).  Created internally if not provided.
+    outbox:
+        Output queue (``asyncio.Queue``).  Created internally if not provided.
+    log_queue:
+        Optional shared log queue for centralised log collection.
     """
 
     async def run(self) -> None:
@@ -84,16 +104,30 @@ class ExampleCoroutineTask(SchedulerAsyncTask):
 
         while True:
             msg = await self.get_item()
+
+            if self._is_shutdown_signal(msg):
+                self.log("info", "SHUTDOWN received — stopping immediately")
+                child_task.cancel()
+                break
+
             if self._is_stop_signal(msg):
-                self.log("info", "received stop — propagating to child")
+                self.log("info", "STOP received — propagating to child")
                 await child_inbox.put(
                     Message.control(sender=self.name, signal=ControlSignal.STOP)
                 )
                 await child_task
                 break
+
+            if self._is_pause_signal(msg):
+                self.log("info", "PAUSE received")
+                await self._wait_for_resume()
+                continue
+
+            # DATA — forward to child and collect result
             await child_inbox.put(msg)
             result = await child_outbox.get()
             child_outbox.task_done()
             await self.put_item(result)
 
         self.log("info", "ExampleCoroutineTask finished")
+

@@ -11,19 +11,27 @@ Hierarchy::
     └── SchedulerProcessTask  — synchronous body runs in a ProcessPoolExecutor
 
     SchedulerManager
-        Owns and sequentially runs a collection of SchedulerTask instances.
+        Owns and concurrently runs a collection of SchedulerTask instances.
 
-Typical usage::
+Pipeline usage::
 
-    manager = SchedulerManager(name="demo-manager")
+    q_in  = asyncio.Queue()
+    q_mid = asyncio.Queue()
+    q_out = asyncio.Queue()
+    log_q = asyncio.Queue()
 
-    coroutine_task = ExampleCoroutineTask(name="coroutine-task-1", log_level="DEBUG")
-    coroutine_task.inbox.put_nowait(Message.data(sender="main", payload={"x": 1}))
-    coroutine_task.inbox.put_nowait(Message.control(sender="main", signal=ControlSignal.STOP))
-    manager.add(coroutine_task)
+    manager = SchedulerManager(name="pipeline")
+    manager.add(StageOneTask(name="s1", inbox=q_in,  outbox=q_mid, log_queue=log_q))
+    manager.add(StageTwoTask(name="s2", inbox=q_mid, outbox=q_out, log_queue=log_q))
 
-    await manager.run_all()
-    print(coroutine_task.results)
+    await manager.run_all()          # all tasks run concurrently
+
+Lifecycle signals consumed by every task's run() loop::
+
+    ControlSignal.STOP     — exit the run loop gracefully
+    ControlSignal.SHUTDOWN — exit immediately (no drain)
+    ControlSignal.PAUSE    — suspend DATA processing until RESUME arrives
+    ControlSignal.RESUME   — resume after a PAUSE
 """
 
 from __future__ import annotations
@@ -40,7 +48,7 @@ from typing import Literal
 from customtypes import ControlSignal, Message, MessageKind
 
 
-Status = Literal["idle", "running", "done", "error"]
+Status = Literal["idle", "running", "paused", "done", "error"]
 
 
 # ---------------------------------------------------------------------------
@@ -79,15 +87,38 @@ class SchedulerTask(ABC):
         Unique identifier used as the logger name and thread/process name.
     log_level:
         Standard Python logging level string (``DEBUG``, ``INFO``, …).
+    inbox:
+        Optional input queue.  If *None* a new queue is created internally.
+        Pass an external queue to wire tasks into a pipeline.
+    outbox:
+        Optional output queue.  If *None* a new queue is created internally.
+        Pass an external queue to wire tasks into a pipeline.
+    log_queue:
+        Optional shared log queue.  When provided, every :meth:`log` call also
+        emits a ``Message(kind=LOG)`` onto this queue for centralised log
+        collection.  The queue type must match the task's execution strategy
+        (``asyncio.Queue`` for async, ``queue.Queue`` for thread/process).
     """
 
-    def __init__(self, name: str, log_level: str = "INFO") -> None:
+    def __init__(
+        self,
+        name: str,
+        log_level: str = "INFO",
+        *,
+        inbox=None,
+        outbox=None,
+        log_queue=None,
+    ) -> None:
         self.name:      str     = name
         self.log_level: str     = log_level
         self._logger            = _make_logger(name, log_level)
         self._status: Status    = "idle"
         self._exc: BaseException | None = None
         self.results: list[Message] = []
+        # Queues are assigned by subclasses (or injected here as a sentinel)
+        self._injected_inbox    = inbox
+        self._injected_outbox   = outbox
+        self._injected_log_queue = log_queue
 
     # ------------------------------------------------------------------
     # Properties — uniform interface consumed by SchedulerManager
@@ -95,12 +126,12 @@ class SchedulerTask(ABC):
 
     @property
     def status(self) -> Status:
-        """Current lifecycle status: ``idle``, ``running``, ``done``, or ``error``."""
+        """Current lifecycle status."""
         return self._status
 
     @property
     def is_running(self) -> bool:
-        """``True`` while the worker thread is executing."""
+        """``True`` while the worker is executing."""
         return self._status == "running"
 
     @property
@@ -113,8 +144,25 @@ class SchedulerTask(ABC):
     # ------------------------------------------------------------------
 
     def log(self, level: str, message: str, *args: object) -> None:
-        """Emit a log record at *level* through this task's private logger."""
+        """
+        Emit a log record through the task's private logger and, if a
+        *log_queue* was provided, also place a LOG :class:`~customtypes.Message`
+        on that queue (subclasses implement :meth:`_emit_log_message`).
+        """
         getattr(self._logger, level.lower())(message, *args)
+        self._emit_log_message(level, message % args if args else message)
+
+    def _emit_log_message(self, level: str, text: str) -> None:
+        """
+        Place a ``Message(kind=LOG)`` on the log queue if one was configured.
+
+        Override in each concrete subclass to match the queue's put semantics
+        (async ``put_nowait`` vs sync ``put_nowait``).  Default is a no-op.
+        """
+
+    # ------------------------------------------------------------------
+    # Control signal helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _is_stop_signal(msg: Message) -> bool:
@@ -122,6 +170,30 @@ class SchedulerTask(ABC):
         return (
             msg.kind == MessageKind.CONTROL
             and (msg.payload or {}).get("signal") == ControlSignal.STOP.value
+        )
+
+    @staticmethod
+    def _is_shutdown_signal(msg: Message) -> bool:
+        """Return ``True`` if *msg* is a CONTROL/SHUTDOWN message."""
+        return (
+            msg.kind == MessageKind.CONTROL
+            and (msg.payload or {}).get("signal") == ControlSignal.SHUTDOWN.value
+        )
+
+    @staticmethod
+    def _is_pause_signal(msg: Message) -> bool:
+        """Return ``True`` if *msg* is a CONTROL/PAUSE message."""
+        return (
+            msg.kind == MessageKind.CONTROL
+            and (msg.payload or {}).get("signal") == ControlSignal.PAUSE.value
+        )
+
+    @staticmethod
+    def _is_resume_signal(msg: Message) -> bool:
+        """Return ``True`` if *msg* is a CONTROL/RESUME message."""
+        return (
+            msg.kind == MessageKind.CONTROL
+            and (msg.payload or {}).get("signal") == ControlSignal.RESUME.value
         )
 
     # ------------------------------------------------------------------
@@ -147,9 +219,31 @@ class SchedulerTask(ABC):
         """
         Task body.  Override this in your subclass with the coordination logic.
 
-        * For :class:`SchedulerAsyncTask` subclasses, declare as ``async def run``.
-        * For :class:`SchedulerThreadTask` and :class:`SchedulerProcessTask`,
-          declare as a plain ``def run``.
+        All queue I/O and lifecycle signals are handled via the base-class API:
+
+        * ``await self.get_item()`` / ``self.get_item(timeout)`` — receive next message
+        * ``await self.put_item(msg)`` / ``self.put_item(msg)``  — send a message
+        * ``self.log(level, …)``                                — structured logging
+        * ``self._is_stop_signal(msg)``                        — STOP detection
+        * ``self._is_shutdown_signal(msg)``                    — SHUTDOWN detection
+        * ``self._is_pause_signal(msg)``                       — PAUSE detection
+        * ``self._is_resume_signal(msg)``                      — RESUME detection
+        * ``await self._wait_for_resume()`` / ``self._wait_for_resume()`` — block until RESUME
+
+        The recommended run() loop pattern::
+
+            async def run(self) -> None:
+                while True:
+                    msg = await self.get_item()
+                    if self._is_shutdown_signal(msg):
+                        break
+                    if self._is_stop_signal(msg):
+                        break
+                    if self._is_pause_signal(msg):
+                        await self._wait_for_resume()
+                        continue
+                    # … process msg.payload …
+                    await self.put_item(Message.result(sender=self.name, payload={…}))
         """
         ...
 
@@ -168,33 +262,80 @@ class SchedulerAsyncTask(SchedulerTask):
     Attributes
     ----------
     inbox:
-        ``asyncio.Queue`` — deposit :class:`~customtypes.Message` objects here
-        *before* calling :meth:`start`.  Use ``put_nowait`` from synchronous
-        context or ``await put`` from async context.
+        ``asyncio.Queue`` — source of incoming :class:`~customtypes.Message` objects.
+        Injected at construction or created internally.
     outbox:
-        ``asyncio.Queue`` populated by the task body.  Drained into
-        :attr:`results` automatically after :meth:`start` returns.
+        ``asyncio.Queue`` — destination for outgoing messages.
+        Injected at construction or created internally.
+        Drained into :attr:`results` automatically after :meth:`run` returns.
+    log_queue:
+        Optional ``asyncio.Queue`` for centralised log collection.
     """
 
-    def __init__(self, name: str, log_level: str = "INFO") -> None:
-        super().__init__(name, log_level)
-        self.inbox:  asyncio.Queue[Message] = asyncio.Queue()
-        self.outbox: asyncio.Queue[Message] = asyncio.Queue()
+    def __init__(
+        self,
+        name: str,
+        log_level: str = "INFO",
+        *,
+        inbox: asyncio.Queue[Message] | None = None,
+        outbox: asyncio.Queue[Message] | None = None,
+        log_queue: asyncio.Queue[Message] | None = None,
+    ) -> None:
+        super().__init__(name, log_level, inbox=inbox, outbox=outbox,
+                         log_queue=log_queue)
+        self.inbox:     asyncio.Queue[Message] = inbox     or asyncio.Queue()
+        self.outbox:    asyncio.Queue[Message] = outbox    or asyncio.Queue()
+        self.log_queue: asyncio.Queue[Message] | None = log_queue
+
+    # -- Log queue emission --------------------------------------------------
+
+    def _emit_log_message(self, level: str, text: str) -> None:
+        if self.log_queue is not None:
+            try:
+                self.log_queue.put_nowait(
+                    Message(
+                        kind=MessageKind.LOG,
+                        sender=self.name,
+                        payload={"level": level.upper(), "message": text},
+                    )
+                )
+            except asyncio.QueueFull:
+                pass  # drop silently rather than block the logger
 
     # -- Queue helpers -------------------------------------------------------
 
     async def get_item(self) -> Message:
         """Await the next message from the inbox and log it."""
         msg = await self.inbox.get()
-        self.log("debug", "get_item ← %s | extra=%r",
-                 msg.kind.value, {"sender": msg.sender})
+        self.log("debug", "get_item ← %s | sender=%s", msg.kind.value, msg.sender)
         return msg
 
     async def put_item(self, msg: Message) -> None:
         """Place *msg* on the outbox and log it."""
-        self.log("debug", "put_item → %s | extra=%r",
-                 msg.kind.value, {"receiver": "outbox"})
+        self.log("debug", "put_item → %s", msg.kind.value)
         await self.outbox.put(msg)
+
+    # -- Lifecycle control helpers -------------------------------------------
+
+    async def _wait_for_resume(self) -> None:
+        """
+        Block the task loop until a CONTROL/RESUME message arrives on the inbox.
+
+        All messages received while paused are discarded except RESUME and
+        SHUTDOWN (which exits immediately).
+        """
+        self._status = "paused"
+        self.log("info", "task paused — waiting for RESUME")
+        while True:
+            msg = await self.inbox.get()
+            if self._is_resume_signal(msg):
+                self._status = "running"
+                self.log("info", "task resumed")
+                return
+            if self._is_shutdown_signal(msg):
+                self._status = "running"
+                self.log("info", "SHUTDOWN received while paused — raising")
+                raise asyncio.CancelledError("SHUTDOWN while paused")
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -221,19 +362,16 @@ class SchedulerAsyncTask(SchedulerTask):
             self._status = "error"
             raise self._exc
 
-        while not self.outbox.empty():
-            self.results.append(self.outbox.get_nowait())
+        # Only drain outbox if it was created internally (not shared pipeline queue)
+        if self._injected_outbox is None:
+            while not self.outbox.empty():
+                self.results.append(self.outbox.get_nowait())
 
         self._status = "done"
 
     @abstractmethod
     async def run(self) -> None:  # type: ignore[override]
-        """
-        Override with the coroutine coordination logic.
-
-        ``self.inbox``, ``self.outbox``, ``self.log()``, and
-        ``self._is_stop_signal()`` are all available.
-        """
+        """Override with the coroutine coordination logic."""
         ...
 
 
@@ -249,18 +387,46 @@ class SchedulerThreadTask(SchedulerTask):
     Attributes
     ----------
     inbox:
-        ``queue.Queue`` — deposit :class:`~customtypes.Message` objects here
-        before calling :meth:`start`.
+        ``queue.Queue`` — source of incoming messages.
+        Injected at construction or created internally.
     outbox:
-        ``queue.Queue`` populated by the task body.  Drained into
-        :attr:`results` automatically after :meth:`start` returns.
+        ``queue.Queue`` — destination for outgoing messages.
+        Injected at construction or created internally.
+        Drained into :attr:`results` automatically after :meth:`run` returns.
+    log_queue:
+        Optional ``queue.Queue`` for centralised log collection.
     """
 
-    def __init__(self, name: str, log_level: str = "INFO") -> None:
-        super().__init__(name, log_level)
-        self.inbox:  queue.Queue[Message] = queue.Queue()
-        self.outbox: queue.Queue[Message] = queue.Queue()
+    def __init__(
+        self,
+        name: str,
+        log_level: str = "INFO",
+        *,
+        inbox: queue.Queue[Message] | None = None,
+        outbox: queue.Queue[Message] | None = None,
+        log_queue: queue.Queue[Message] | None = None,
+    ) -> None:
+        super().__init__(name, log_level, inbox=inbox, outbox=outbox,
+                         log_queue=log_queue)
+        self.inbox:     queue.Queue[Message] = inbox     or queue.Queue()
+        self.outbox:    queue.Queue[Message] = outbox    or queue.Queue()
+        self.log_queue: queue.Queue[Message] | None = log_queue
         self._stop_event: threading.Event = threading.Event()
+
+    # -- Log queue emission --------------------------------------------------
+
+    def _emit_log_message(self, level: str, text: str) -> None:
+        if self.log_queue is not None:
+            try:
+                self.log_queue.put_nowait(
+                    Message(
+                        kind=MessageKind.LOG,
+                        sender=self.name,
+                        payload={"level": level.upper(), "message": text},
+                    )
+                )
+            except Exception:
+                pass
 
     # -- Queue helpers -------------------------------------------------------
 
@@ -272,8 +438,7 @@ class SchedulerThreadTask(SchedulerTask):
         """
         try:
             msg = self.inbox.get(block=True, timeout=timeout)
-            self.log("debug", "get_item ← %s | extra=%r",
-                     msg.kind.value, {"sender": msg.sender})
+            self.log("debug", "get_item ← %s | sender=%s", msg.kind.value, msg.sender)
             return msg
         except queue.Empty:
             return None
@@ -282,6 +447,31 @@ class SchedulerThreadTask(SchedulerTask):
         """Place *msg* on the outbox and log it."""
         self.log("debug", "put_item → %s", msg.kind.value)
         self.outbox.put(msg)
+
+    # -- Lifecycle control helpers -------------------------------------------
+
+    def _wait_for_resume(self) -> bool:
+        """
+        Block until a CONTROL/RESUME message arrives on the inbox.
+
+        Returns ``True`` when resumed, ``False`` when a SHUTDOWN was received
+        (caller should exit the run loop).  All other messages are discarded.
+        """
+        self._status = "paused"
+        self.log("info", "task paused — waiting for RESUME")
+        while not self._stop_event.is_set():
+            msg = self.get_item(timeout=0.5)
+            if msg is None:
+                continue
+            if self._is_resume_signal(msg):
+                self._status = "running"
+                self.log("info", "task resumed")
+                return True
+            if self._is_shutdown_signal(msg):
+                self._status = "running"
+                self.log("info", "SHUTDOWN received while paused")
+                return False
+        return False
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -301,19 +491,15 @@ class SchedulerThreadTask(SchedulerTask):
                 self._status = "error"
                 raise
 
-        while not self.outbox.empty():
-            self.results.append(self.outbox.get_nowait())
+        if self._injected_outbox is None:
+            while not self.outbox.empty():
+                self.results.append(self.outbox.get_nowait())
 
         self._status = "done"
 
     @abstractmethod
     def run(self) -> None:
-        """
-        Override with the synchronous coordination logic.
-
-        ``self.inbox``, ``self.outbox``, ``self._stop_event``, ``self.log()``,
-        and ``self._is_stop_signal()`` are all available.
-        """
+        """Override with the synchronous coordination logic."""
         ...
 
 
@@ -334,14 +520,29 @@ class SchedulerProcessTask(SchedulerTask):
 
     Pre-feed messages with :meth:`feed` before calling :meth:`start`; they are
     loaded into the Manager inbox queue when :meth:`start` runs.
+
+    .. note::
+        When injecting external queues for pipeline wiring they **must** be
+        ``multiprocessing.Manager().Queue()`` proxies created before constructing
+        the tasks, with the manager context kept alive for the full run duration.
     """
 
-    def __init__(self, name: str, log_level: str = "INFO") -> None:
-        super().__init__(name, log_level)
+    def __init__(
+        self,
+        name: str,
+        log_level: str = "INFO",
+        *,
+        inbox=None,
+        outbox=None,
+        log_queue=None,
+    ) -> None:
+        super().__init__(name, log_level, inbox=inbox, outbox=outbox,
+                         log_queue=log_queue)
         self._pre_inbox: list[str] = []
-        # Assigned by start() before pickling:
-        self.inbox  = None  # multiprocessing.Manager().Queue proxy
-        self.outbox = None  # multiprocessing.Manager().Queue proxy
+        # If injected, used as-is; otherwise assigned by start()
+        self.inbox    = inbox   # multiprocessing.Manager().Queue proxy or None
+        self.outbox   = outbox  # multiprocessing.Manager().Queue proxy or None
+        self.log_queue = log_queue
 
     # -- Pickling support ----------------------------------------------------
 
@@ -356,6 +557,21 @@ class SchedulerProcessTask(SchedulerTask):
         self.__dict__.update(state)
         self._logger = _make_logger(self.name, self.log_level)
 
+    # -- Log queue emission --------------------------------------------------
+
+    def _emit_log_message(self, level: str, text: str) -> None:
+        if self.log_queue is not None:
+            try:
+                self.log_queue.put_nowait(
+                    Message(
+                        kind=MessageKind.LOG,
+                        sender=self.name,
+                        payload={"level": level.upper(), "message": text},
+                    ).to_json()
+                )
+            except Exception:
+                pass
+
     # -- Pre-feed ------------------------------------------------------------
 
     def feed(self, msg: Message) -> None:
@@ -363,7 +579,8 @@ class SchedulerProcessTask(SchedulerTask):
         Buffer *msg* for delivery into the inbox when :meth:`start` is called.
 
         Use this instead of writing directly to :attr:`inbox` because the
-        Manager queue does not exist until :meth:`start` creates it.
+        Manager queue does not exist until :meth:`start` creates it (unless
+        an external inbox was injected at construction time).
         """
         self._pre_inbox.append(msg.to_json())
 
@@ -377,8 +594,7 @@ class SchedulerProcessTask(SchedulerTask):
             else self.inbox.get()
         )
         msg = Message.from_json(raw) if isinstance(raw, str) else raw
-        self.log("debug", "get_item ← %s | extra=%r",
-                 msg.kind.value, {"sender": msg.sender})
+        self.log("debug", "get_item ← %s | sender=%s", msg.kind.value, msg.sender)
         return msg
 
     def put_item(self, msg: Message) -> None:
@@ -386,18 +602,62 @@ class SchedulerProcessTask(SchedulerTask):
         self.log("debug", "put_item → %s", msg.kind.value)
         self.outbox.put(msg.to_json())
 
+    # -- Lifecycle control helpers -------------------------------------------
+
+    def _wait_for_resume(self) -> bool:
+        """
+        Block until CONTROL/RESUME arrives on the inbox.
+
+        Returns ``True`` when resumed, ``False`` on SHUTDOWN.
+        All other messages are discarded while paused.
+        """
+        self._status = "paused"
+        self.log("info", "task paused — waiting for RESUME")
+        while True:
+            try:
+                msg = self.get_item(timeout=1.0)
+            except Exception:
+                continue
+            if self._is_resume_signal(msg):
+                self._status = "running"
+                self.log("info", "task resumed")
+                return True
+            if self._is_shutdown_signal(msg):
+                self._status = "running"
+                self.log("info", "SHUTDOWN received while paused")
+                return False
+        return False  # unreachable
+
     # -- Lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
         """
-        Create Manager queues, feed buffered messages, run :meth:`run` in a
-        ProcessPoolExecutor, then drain outbox into :attr:`results`.
+        Create Manager queues (if not injected), feed buffered messages,
+        run :meth:`run` in a ProcessPoolExecutor, then drain outbox into
+        :attr:`results`.
         """
         self._status = "running"
         self._exc    = None
         self.results = []
 
         loop = asyncio.get_running_loop()
+
+        # Use injected queues if provided, else create them inside a Manager ctx
+        if self._injected_inbox is not None and self._injected_outbox is not None:
+            # Queues already exist — run without creating a new Manager context
+            for raw in self._pre_inbox:
+                self.inbox.put(raw)
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                try:
+                    await loop.run_in_executor(executor, self.run)
+                except BaseException as exc:  # noqa: BLE001
+                    self._exc    = exc
+                    self._status = "error"
+                    raise
+            # Injected outbox — do not drain into results (shared)
+            self._status = "done"
+            return
+
         with multiprocessing.Manager() as mgr:
             self.inbox  = mgr.Queue()
             self.outbox = mgr.Queue()
@@ -423,13 +683,7 @@ class SchedulerProcessTask(SchedulerTask):
 
     @abstractmethod
     def run(self) -> None:
-        """
-        Override with the synchronous coordination logic (runs in a subprocess).
-
-        ``self.inbox`` and ``self.outbox`` are Manager queue proxies; use
-        :meth:`get_item` and :meth:`put_item` for typed message I/O.
-        ``self.log()`` and ``self._is_stop_signal()`` are also available.
-        """
+        """Override with the synchronous coordination logic (runs in a subprocess)."""
         ...
 
 
@@ -439,26 +693,25 @@ class SchedulerProcessTask(SchedulerTask):
 
 class SchedulerManager:
     """
-    Registry and sequential runner for a collection of :class:`SchedulerTask` objects.
+    Registry and runner for a collection of :class:`SchedulerTask` objects.
+
+    By default :meth:`run_all` runs all tasks **concurrently** via
+    ``asyncio.gather``, so tasks can form a pipeline without deadlocking on
+    each other's queues.  Pass ``concurrent=False`` to restore the original
+    sequential behaviour.
 
     Parameters
     ----------
     name:
         Human-readable label for this manager instance.
-
-    Example
-    -------
-    ::
-
-        manager = SchedulerManager(name="demo-manager")
-        manager.add(ExampleCoroutineTask(name="coroutine-task-1", log_level="DEBUG"))
-        manager.add(ExampleThreadTask(name="thread-task-1",    log_level="DEBUG"))
-        await manager.run_all()
-        print(manager.status)   # "done" or "error"
+    concurrent:
+        If ``True`` (default) all tasks are started simultaneously.
+        If ``False`` tasks are started one by one in registration order.
     """
 
-    def __init__(self, name: str = "scheduler-manager") -> None:
+    def __init__(self, name: str = "scheduler-manager", *, concurrent: bool = True) -> None:
         self.name: str = name
+        self.concurrent: bool = concurrent
         self._tasks: list[SchedulerTask] = []
         self._status: Status = "idle"
 
@@ -468,14 +721,7 @@ class SchedulerManager:
 
     @property
     def status(self) -> Status:
-        """
-        Aggregate status.
-
-        * ``idle``    — no tasks have been started yet.
-        * ``running`` — at least one task is currently executing.
-        * ``error``   — a task raised an exception (run_all stopped early).
-        * ``done``    — all tasks completed successfully.
-        """
+        """Aggregate lifecycle status."""
         return self._status
 
     @property
@@ -488,22 +734,11 @@ class SchedulerManager:
     # ------------------------------------------------------------------
 
     def add(self, task: SchedulerTask) -> None:
-        """
-        Register a :class:`SchedulerTask` with this manager.
-
-        Parameters
-        ----------
-        task:
-            Task to append to the execution queue.
-        """
+        """Register a task with this manager."""
         self._tasks.append(task)
 
     def get(self, name: str) -> SchedulerTask | None:
-        """
-        Look up a registered task by name.
-
-        Returns ``None`` if no task with that name exists.
-        """
+        """Look up a registered task by name.  Returns ``None`` if not found."""
         return next((t for t in self._tasks if t.name == name), None)
 
     # ------------------------------------------------------------------
@@ -512,12 +747,14 @@ class SchedulerManager:
 
     async def run_all(self) -> None:
         """
-        Run all registered tasks **sequentially**, in registration order.
+        Run all registered tasks.
 
-        Each task's :meth:`~SchedulerTask.start` method handles its own
-        infrastructure (isolated loop, executor, queues).  Execution stops
-        immediately if any task raises an exception; :attr:`status` is set to
-        ``"error"`` and the exception is re-raised.
+        When *concurrent* is ``True`` (default) all tasks start simultaneously
+        via ``asyncio.gather`` — required for pipeline topologies where tasks
+        block on each other's queues.
+
+        When *concurrent* is ``False`` tasks run sequentially in registration
+        order; the first exception stops execution immediately.
 
         Raises
         ------
@@ -525,9 +762,18 @@ class SchedulerManager:
             Re-raises the first exception that escaped from any task.
         """
         self._status = "running"
-        for task in self._tasks:
-            await task.start()
-            if task.status == "error":
+        if self.concurrent:
+            try:
+                await asyncio.gather(*(task.start() for task in self._tasks))
+            except BaseException as exc:  # noqa: BLE001
                 self._status = "error"
-                raise task.exception  # type: ignore[misc]
+                raise
+        else:
+            for task in self._tasks:
+                await task.start()
+                if task.status == "error":
+                    self._status = "error"
+                    raise task.exception  # type: ignore[misc]
         self._status = "done"
+
+

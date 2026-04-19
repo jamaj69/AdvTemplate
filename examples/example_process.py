@@ -1,20 +1,27 @@
 """
 examples/example_process.py
 ============================
-Example process coordination task.
+Example process coordination task demonstrating the pipeline + lifecycle pattern.
 
-Demonstrates the pattern for a :class:`~coordination.scheduler.SchedulerProcessTask`:
-
+Key behaviours
+--------------
 * Subclass :class:`SchedulerProcessTask` and override ``def run()`` (synchronous).
-* Use ``self.get_item(timeout=…)`` / ``self.put_item(msg)`` for message I/O.
-* ``self.inbox`` and ``self.outbox`` are ``multiprocessing.Manager().Queue()``
-  proxies, set by :meth:`~coordination.scheduler.SchedulerProcessTask.start`
-  before the process is spawned.
-* All instance attributes must be **picklable**.
+* Queues (``inbox``, ``outbox``, ``log_queue``) are injected via the
+  constructor — the base class exposes them; ``run()`` never touches raw
+  queues directly.
+* ``get_item(timeout)`` returns any :class:`~customtypes.Message`.
+  The run loop dispatches:
 
-Child tasks still use :class:`~coordination.process_task.ProcessCoordinationTask`
-as they are internal implementation details of the parent.  Their queues are
-plain ``multiprocessing.Queue`` objects shared via fork.
+  - ``STOP``     → drain child, exit gracefully.
+  - ``SHUTDOWN`` → terminate child process, exit immediately.
+  - ``PAUSE``    → call ``self._wait_for_resume()``.
+  - ``DATA``     → forward to child, collect result.
+
+* All instance attributes must be **picklable** (the task object is serialised
+  to cross the process boundary via ``ProcessPoolExecutor``).
+
+Child tasks use :class:`~coordination.process_task.ProcessCoordinationTask`
+with plain ``multiprocessing.Queue`` objects shared via fork.
 """
 
 from __future__ import annotations
@@ -66,9 +73,24 @@ class ExampleProcessTask(SchedulerProcessTask):
     """
     Example process coordination task.
 
-    Spawns a :class:`_ChildProcessTask` via :class:`multiprocessing.Process`,
-    forwards every incoming DATA message to it, collects results, and places
-    them on its own outbox.  Stops cleanly when it receives a CONTROL/STOP signal.
+    Accepts injected ``inbox``, ``outbox`` and ``log_queue`` for pipeline
+    wiring.  Handles the full lifecycle: DATA processing, PAUSE/RESUME,
+    STOP and SHUTDOWN.
+
+    Parameters
+    ----------
+    name:
+        Task identifier.
+    log_level:
+        Logging verbosity.
+    inbox:
+        Input Manager queue proxy.  Created internally by :meth:`start` if not
+        provided.
+    outbox:
+        Output Manager queue proxy.  Created internally by :meth:`start` if not
+        provided.
+    log_queue:
+        Optional shared log queue (Manager proxy) for centralised log collection.
     """
 
     def run(self) -> None:
@@ -100,13 +122,31 @@ class ExampleProcessTask(SchedulerProcessTask):
                 msg = self.get_item(timeout=5.0)
             except Exception:
                 break
+
+            if self._is_shutdown_signal(msg):
+                self.log("info", "SHUTDOWN received — terminating child immediately")
+                child_proc.terminate()
+                child_proc.join(timeout=5.0)
+                break
+
             if self._is_stop_signal(msg):
-                self.log("info", "received stop — propagating to child")
+                self.log("info", "STOP received — propagating to child")
                 child_inbox.put(
                     Message.control(sender=self.name, signal=ControlSignal.STOP).to_json()
                 )
                 child_proc.join(timeout=10.0)
                 break
+
+            if self._is_pause_signal(msg):
+                self.log("info", "PAUSE received")
+                if not self._wait_for_resume():
+                    # SHUTDOWN arrived while paused
+                    child_proc.terminate()
+                    child_proc.join(timeout=5.0)
+                    break
+                continue
+
+            # DATA — forward to child and collect result
             child_inbox.put(msg.to_json())
             try:
                 raw = child_outbox.get(timeout=5.0)
@@ -116,3 +156,4 @@ class ExampleProcessTask(SchedulerProcessTask):
                 self.log("warning", "timeout waiting for child result")
 
         self.log("info", "ExampleProcessTask finished")
+

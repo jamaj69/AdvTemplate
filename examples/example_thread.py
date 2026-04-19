@@ -1,17 +1,23 @@
 """
 examples/example_thread.py
 ===========================
-Example thread coordination task.
+Example thread coordination task demonstrating the pipeline + lifecycle pattern.
 
-Demonstrates the pattern for a :class:`~coordination.scheduler.SchedulerThreadTask`:
-
+Key behaviours
+--------------
 * Subclass :class:`SchedulerThreadTask` and override ``def run()`` (synchronous).
-* Use ``self.get_item(timeout=…)`` / ``self.put_item(msg)`` for message I/O.
-* ``self.inbox`` and ``self.outbox`` are ``queue.Queue`` instances.
-* Poll ``self._stop_event`` to support cooperative cancellation.
+* Queues (``inbox``, ``outbox``, ``log_queue``) are injected via the
+  constructor — the base class exposes them; ``run()`` never touches raw
+  queues directly.
+* ``get_item(timeout)`` returns any :class:`~customtypes.Message` or ``None``
+  on timeout (allowing ``_stop_event`` polling).  The run loop dispatches:
 
-Child tasks still use :class:`~coordination.thread_task.ThreadCoordinationTask`
-as they are internal implementation details of the parent.
+  - ``STOP``     → drain child, exit gracefully.
+  - ``SHUTDOWN`` → exit immediately.
+  - ``PAUSE``    → call ``self._wait_for_resume()``.
+  - ``DATA``     → forward to child, collect result.
+
+Child tasks use :class:`~coordination.thread_task.ThreadCoordinationTask`.
 """
 
 from __future__ import annotations
@@ -63,9 +69,22 @@ class ExampleThreadTask(SchedulerThreadTask):
     """
     Example thread coordination task.
 
-    Spawns a :class:`_ChildThreadTask` in a dedicated :class:`threading.Thread`,
-    forwards every incoming DATA message to it, collects results, and places
-    them on its own outbox.  Stops cleanly when it receives a CONTROL/STOP signal.
+    Accepts injected ``inbox``, ``outbox`` and ``log_queue`` for pipeline
+    wiring.  Handles the full lifecycle: DATA processing, PAUSE/RESUME,
+    STOP and SHUTDOWN.
+
+    Parameters
+    ----------
+    name:
+        Task identifier.
+    log_level:
+        Logging verbosity.
+    inbox:
+        Input queue (``queue.Queue``).  Created internally if not provided.
+    outbox:
+        Output queue (``queue.Queue``).  Created internally if not provided.
+    log_queue:
+        Optional shared log queue for centralised log collection.
     """
 
     def run(self) -> None:
@@ -92,13 +111,28 @@ class ExampleThreadTask(SchedulerThreadTask):
             msg = self.get_item(timeout=0.5)
             if msg is None:
                 continue
+
+            if self._is_shutdown_signal(msg):
+                self.log("info", "SHUTDOWN received — stopping immediately")
+                child._stop_event.set()
+                child_thread.join(timeout=2.0)
+                break
+
             if self._is_stop_signal(msg):
-                self.log("info", "received stop — propagating to child")
+                self.log("info", "STOP received — propagating to child")
                 child_inbox.put(
                     Message.control(sender=self.name, signal=ControlSignal.STOP)
                 )
                 child_thread.join(timeout=5.0)
                 break
+
+            if self._is_pause_signal(msg):
+                self.log("info", "PAUSE received")
+                if not self._wait_for_resume():
+                    break   # SHUTDOWN arrived while paused
+                continue
+
+            # DATA — forward to child and collect result
             child_inbox.put(msg)
             try:
                 result = child_outbox.get(timeout=5.0)
@@ -107,3 +141,5 @@ class ExampleThreadTask(SchedulerThreadTask):
                 self.log("warning", "timeout waiting for child result")
 
         self.log("info", "ExampleThreadTask finished")
+
+
