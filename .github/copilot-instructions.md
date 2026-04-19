@@ -1,8 +1,8 @@
 # Copilot Instructions — AdvTemplate
 
-## Context Restore Checklist
+## ⚠️ MANDATORY: Context Restore on Session Start
 
-Read these files at the start of every session to restore full context:
+**Before answering ANY question**, read ALL files below in order to fully restore context:
 
 1. `README.md` — project overview and quick-start
 2. `docs/ARCHITECTURE.md` — full class hierarchy, isolated loop model, data flow, design principles
@@ -11,6 +11,9 @@ Read these files at the start of every session to restore full context:
 5. `coordination/scheduler.py` — `SchedulerTask` ABC, three subclasses, `SchedulerManager`
 6. `coordination/base.py` — `BaseCoordinationTask` (used by internal child tasks)
 7. `examples/example_*.py` — concrete task implementations
+
+> These files are the single source of truth for architecture, patterns, and conventions.
+> Do **not** guess or infer behaviour that can be verified by reading them.
 
 ---
 
@@ -27,29 +30,35 @@ uniform `get_item()` / `put_item()` / `log()` API.
 
 ```
 SchedulerTask (ABC)                 coordination/scheduler.py
-├── start()      ← called by SchedulerManager
+├── name, log_level, results: list[Message]
+├── status, is_running, exception  (properties)
+├── start()      ← called by SchedulerManager (abstract, async)
 ├── run()        ← abstract; overridden by user
-├── log(), _is_stop_signal()
-│
-├── SchedulerAsyncTask
-│   ├── inbox / outbox : asyncio.Queue
-│   ├── get_item() / put_item()  — async
-│   └── start() — isolated thread + asyncio.run(self.run())
-│
-├── SchedulerThreadTask
-│   ├── inbox / outbox : queue.Queue
-│   ├── _stop_event : threading.Event
-│   ├── get_item(timeout) / put_item()  — sync
-│   └── start() — ThreadPoolExecutor
-│
-└── SchedulerProcessTask
-    ├── feed(msg)  — buffer before start()
-    ├── get_item() / put_item()  — sync, JSON-serialised
-    ├── __getstate__ / __setstate__  — pickle-safe
-    └── start() — Manager queues + ProcessPoolExecutor
+├── log(level, message, *args)
+└── _is_stop_signal(msg) -> bool   (staticmethod)
+    │
+    ├── SchedulerAsyncTask
+    │   ├── inbox / outbox : asyncio.Queue
+    │   ├── get_item() / put_item()  — async
+    │   └── start() — isolated thread + asyncio.run(self.run())
+    │
+    ├── SchedulerThreadTask
+    │   ├── inbox / outbox : queue.Queue
+    │   ├── _stop_event : threading.Event
+    │   ├── get_item(timeout) / put_item()  — sync
+    │   └── start() — ThreadPoolExecutor
+    │
+    └── SchedulerProcessTask
+        ├── _pre_inbox: list[str]
+        ├── inbox / outbox : Manager().Queue proxy  (set by start())
+        ├── feed(msg)  — buffer before start()
+        ├── get_item(timeout) / put_item()  — sync, JSON-serialised
+        ├── __getstate__ / __setstate__  — pickle-safe
+        └── start() — Manager queues + ProcessPoolExecutor
 
 SchedulerManager
-├── add(task), get(name), tasks, status
+├── name, status (property), tasks (property)
+├── add(task), get(name)
 └── run_all()  — calls task.start() sequentially
 ```
 
