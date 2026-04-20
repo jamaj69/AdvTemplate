@@ -6,9 +6,10 @@ Abstract base and three concrete scheduler task types, plus the manager.
 Hierarchy::
 
     SchedulerTask (ABC)
-    ├── SchedulerAsyncTask    — coroutine body runs in an isolated asyncio loop
-    ├── SchedulerThreadTask   — synchronous body runs in a ThreadPoolExecutor
-    └── SchedulerProcessTask  — synchronous body runs in a ProcessPoolExecutor
+    ├── SchedulerAsyncTask      — coroutine body runs in an isolated asyncio loop
+    ├── SchedulerThreadTask     — synchronous body runs in a ThreadPoolExecutor
+    ├── SchedulerProcessTask    — synchronous body runs in a ProcessPoolExecutor
+    └── SchedulerProcessPoolTask — persistent N-worker pool; zero per-task spawn cost
 
     SchedulerManager
         Owns and concurrently runs a collection of SchedulerTask instances.
@@ -37,12 +38,13 @@ Lifecycle signals consumed by every task's run() loop::
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import multiprocessing
 import queue
 import threading
 from abc import ABC, abstractmethod
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 from customtypes import ControlSignal, Message, MessageKind
@@ -684,6 +686,325 @@ class SchedulerProcessTask(SchedulerTask):
     @abstractmethod
     def run(self) -> None:
         """Override with the synchronous coordination logic (runs in a subprocess)."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Process pool strategy
+# ---------------------------------------------------------------------------
+
+class SchedulerProcessPoolTask(SchedulerTask):
+    """
+    A pool of *num_workers* persistent worker processes sharing a common work
+    queue.
+
+    Unlike :class:`SchedulerProcessTask` — which spawns and destroys one
+    process per :meth:`start` call — this class pre-spawns *num_workers*
+    processes that each run :meth:`run` in a loop, waiting on a shared work
+    queue.  Processes are never recycled; they live from the first
+    :meth:`start` call until the pool receives a STOP or SHUTDOWN signal.
+
+    A lightweight **pool controller** (running in the :meth:`start` thread)
+    sits between the external pool inbox and the workers' shared work queue:
+
+    * ``DATA`` messages are forwarded to the work queue; workers compete for
+      them naturally (OS-level load balancing).
+    * One ``STOP``     → controller injects *num_workers* STOP poison pills.
+    * One ``SHUTDOWN`` → controller injects *num_workers* SHUTDOWN pills for
+      immediate exit.
+    * ``PAUSE`` / ``RESUME`` suspend / resume forwarding without touching the
+      workers' queue; messages received while paused are buffered and flushed
+      on RESUME.
+
+    Pre-feed messages with :meth:`feed` before calling :meth:`start`; the
+    final message should be a STOP (or SHUTDOWN) signal.
+
+    Attributes
+    ----------
+    num_workers:
+        Number of persistent worker processes to spawn.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_workers: int = 4,
+        log_level: str = "INFO",
+        *,
+        inbox=None,
+        outbox=None,
+        log_queue=None,
+    ) -> None:
+        super().__init__(name, log_level, inbox=inbox, outbox=outbox,
+                         log_queue=log_queue)
+        self.num_workers: int = num_workers
+        self._pre_inbox: list[str] = []
+        self.inbox     = inbox     # pool controller inbox  (set by start())
+        self.outbox    = outbox    # shared result queue    (set by start())
+        self.log_queue = log_queue
+
+    # -- Pickling support ----------------------------------------------------
+
+    def __getstate__(self) -> dict:
+        """Exclude the logger from the pickle payload."""
+        state = self.__dict__.copy()
+        state.pop("_logger", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Rebuild the logger after unpickling in a worker process."""
+        self.__dict__.update(state)
+        self._logger = _make_logger(self.name, self.log_level)
+
+    # -- Log queue emission --------------------------------------------------
+
+    def _emit_log_message(self, level: str, text: str) -> None:
+        if self.log_queue is not None:
+            try:
+                self.log_queue.put_nowait(
+                    Message(
+                        kind=MessageKind.LOG,
+                        sender=self.name,
+                        payload={"level": level.upper(), "message": text},
+                    ).to_json()
+                )
+            except Exception:
+                pass
+
+    # -- Pre-feed ------------------------------------------------------------
+
+    def feed(self, msg: Message) -> None:
+        """
+        Buffer *msg* for delivery to the pool controller when :meth:`start`
+        runs.  Use this instead of writing directly to :attr:`inbox` because
+        the Manager queue does not exist until :meth:`start` creates it.
+        """
+        self._pre_inbox.append(msg.to_json())
+
+    # -- Queue helpers (called by worker processes) --------------------------
+
+    def get_item(self, timeout: float | None = None) -> Message:
+        """
+        Retrieve the next work item from the shared work queue.
+
+        Workers call this inside their :meth:`run` loop.  ``self.inbox`` points
+        to the *work queue* (not the pool controller's external inbox) once the
+        worker process has been set up by :meth:`start`.
+        """
+        raw = (
+            self.inbox.get(timeout=timeout)
+            if timeout is not None
+            else self.inbox.get()
+        )
+        msg = Message.from_json(raw) if isinstance(raw, str) else raw
+        self.log("debug", "get_item ← %s | sender=%s", msg.kind.value, msg.sender)
+        return msg
+
+    def put_item(self, msg: Message) -> None:
+        """Serialise and place *msg* on the shared result queue."""
+        self.log("debug", "put_item → %s", msg.kind.value)
+        self.outbox.put(msg.to_json())
+
+    # -- Lifecycle control helper (used by workers) --------------------------
+
+    def _wait_for_resume(self) -> bool:
+        """
+        Block until CONTROL/RESUME arrives on the work queue.
+
+        Returns ``True`` when resumed, ``False`` on SHUTDOWN.
+        All other messages are discarded while paused.
+        """
+        self._status = "paused"
+        self.log("info", "worker paused — waiting for RESUME")
+        while True:
+            try:
+                msg = self.get_item(timeout=1.0)
+            except Exception:
+                continue
+            if self._is_resume_signal(msg):
+                self._status = "running"
+                self.log("info", "worker resumed")
+                return True
+            if self._is_shutdown_signal(msg):
+                self._status = "running"
+                return False
+
+    # -- Pool controller (runs in the start() thread) ------------------------
+
+    def _run_controller(
+        self,
+        pool_inbox,   # Manager.Queue — external messages arrive here
+        work_queue,   # Manager.Queue — forwarded to workers
+    ) -> None:
+        """
+        Forward messages from *pool_inbox* to *work_queue*, translating
+        lifecycle signals so a single external STOP/SHUTDOWN reaches every
+        worker exactly once.
+        """
+        paused = False
+        buffer: list[str] = []
+        self.log("info", "pool controller started (%d workers)", self.num_workers)
+
+        while True:
+            try:
+                raw = pool_inbox.get(timeout=1.0)
+            except Exception:
+                continue
+
+            msg = Message.from_json(raw) if isinstance(raw, str) else raw
+
+            if self._is_shutdown_signal(msg):
+                self.log("info",
+                         "pool controller: SHUTDOWN — broadcasting to %d workers",
+                         self.num_workers)
+                pill = Message.control(
+                    sender=self.name, signal=ControlSignal.SHUTDOWN
+                ).to_json()
+                for _ in range(self.num_workers):
+                    work_queue.put(pill)
+                break
+
+            if self._is_stop_signal(msg):
+                self.log("info",
+                         "pool controller: STOP — broadcasting to %d workers",
+                         self.num_workers)
+                pill = Message.control(
+                    sender=self.name, signal=ControlSignal.STOP
+                ).to_json()
+                for _ in range(self.num_workers):
+                    work_queue.put(pill)
+                break
+
+            if self._is_pause_signal(msg):
+                self.log("info",
+                         "pool controller: PAUSE — buffering incoming messages")
+                paused = True
+                continue
+
+            if self._is_resume_signal(msg):
+                self.log("info",
+                         "pool controller: RESUME — flushing %d buffered messages",
+                         len(buffer))
+                paused = False
+                for item in buffer:
+                    work_queue.put(item)
+                buffer.clear()
+                continue
+
+            # Regular message — forward or buffer
+            if paused:
+                buffer.append(raw)
+            else:
+                work_queue.put(raw)
+
+        self.log("info", "pool controller finished")
+
+    # -- Internal pool runner ------------------------------------------------
+
+    def _start_pool(self) -> None:
+        """
+        Create Manager queues, spawn *num_workers* processes, run the pool
+        controller, join workers, and drain results.  Runs inside a
+        ``ThreadPoolExecutor`` thread so the asyncio loop is not blocked.
+        """
+        with multiprocessing.Manager() as mgr:
+            pool_inbox   = mgr.Queue()   # external → controller
+            work_queue   = mgr.Queue()   # controller → workers (shared)
+            result_queue = (
+                self._injected_outbox
+                if self._injected_outbox is not None
+                else mgr.Queue()
+            )
+
+            # Expose for external reference after start() returns
+            self.inbox  = pool_inbox
+            self.outbox = result_queue
+
+            # Load pre-fed messages into the pool controller's inbox
+            for raw in self._pre_inbox:
+                pool_inbox.put(raw)
+
+            # Spawn num_workers persistent processes.
+            # Each worker copy has self.inbox = work_queue so get_item()
+            # reads from the shared work queue, not the controller's inbox.
+            processes: list[multiprocessing.Process] = []
+            for i in range(self.num_workers):
+                worker        = copy.copy(self)
+                worker.inbox  = work_queue   # workers pull from here
+                worker.outbox = result_queue
+                p = multiprocessing.Process(
+                    target=worker.run,
+                    name=f"{self.name}-worker-{i}",
+                    daemon=False,
+                )
+                p.start()
+                self.log("info", "spawned worker-%d (pid=%d)", i, p.pid)
+                processes.append(p)
+
+            # Run the pool controller — blocks until STOP / SHUTDOWN received
+            self._run_controller(pool_inbox, work_queue)
+
+            # Wait for all workers to exit gracefully
+            for i, p in enumerate(processes):
+                p.join(timeout=30.0)
+                if p.is_alive():
+                    self.log("warning",
+                             "worker-%d (pid=%d) did not exit — terminating",
+                             i, p.pid)
+                    p.terminate()
+                    p.join(timeout=5.0)
+
+            # Drain results into task.results (only if outbox is internal)
+            if self._injected_outbox is None:
+                while not result_queue.empty():
+                    raw = result_queue.get_nowait()
+                    self.results.append(
+                        Message.from_json(raw) if isinstance(raw, str) else raw
+                    )
+
+    # -- Lifecycle -----------------------------------------------------------
+
+    async def start(self) -> None:
+        """
+        Spawn the worker pool, run the controller, join all workers,
+        and drain results into :attr:`results`.
+        """
+        self._status = "running"
+        self._exc    = None
+        self.results = []
+
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                await loop.run_in_executor(executor, self._start_pool)
+            except BaseException as exc:  # noqa: BLE001
+                self._exc    = exc
+                self._status = "error"
+                raise
+
+        self._status = "done"
+
+    @abstractmethod
+    def run(self) -> None:
+        """
+        Worker body — runs inside each worker subprocess.
+
+        Override this with the coordination logic.  The recommended pattern::
+
+            def run(self) -> None:
+                while True:
+                    try:
+                        msg = self.get_item(timeout=5.0)
+                    except Exception:
+                        break
+                    if self._is_shutdown_signal(msg): break
+                    if self._is_stop_signal(msg):     break
+                    if self._is_pause_signal(msg):
+                        if not self._wait_for_resume(): break
+                        continue
+                    # … process msg.payload …
+                    self.put_item(Message.result(sender=self.name, payload={…}))
+        """
         ...
 
 

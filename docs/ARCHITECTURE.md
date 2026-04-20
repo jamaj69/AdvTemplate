@@ -8,6 +8,15 @@ three execution strategies via `SchedulerManager`. Each coordination task can,
 in turn, spawn its own child tasks — creating a two-level (or deeper)
 coordination hierarchy.
 
+The reference implementation in `main.py` is a realistic **RSS aggregator
+pipeline** that demonstrates all three strategies working together:
+
+```
+Phase 1  RSSFetchTask  (SchedulerAsyncTask)    — concurrent HTTP fetching via aiohttp
+Phase 2  RSSParserTask (SchedulerProcessTask)  — XML parsing in a subprocess
+Phase 3  APIServerTask (SchedulerThreadTask)   — FastAPI/uvicorn HTTP API in a thread
+```
+
 ---
 
 ## Class Hierarchy
@@ -21,41 +30,66 @@ SchedulerTask (ABC)                       coordination/scheduler.py
 ├── is_running: bool        (property)
 ├── exception: BaseException | None  (property)
 ├── log(level, message, *args) -> None
-├── _is_stop_signal(msg) -> bool     (staticmethod)
-├── start() -> None                  (abstract, async)
-└── run() -> None                    (abstract)
+├── _is_stop_signal(msg) -> bool      (staticmethod)
+├── _is_shutdown_signal(msg) -> bool  (staticmethod)
+├── _is_pause_signal(msg) -> bool     (staticmethod)
+├── _is_resume_signal(msg) -> bool    (staticmethod)
+├── start() -> None                   (abstract, async)
+└── run() -> None                     (abstract)
     │
     ├── SchedulerAsyncTask
-    │   ├── inbox:  asyncio.Queue[Message]
-    │   ├── outbox: asyncio.Queue[Message]
-    │   ├── get_item() -> Message           (async)
-    │   ├── put_item(msg) -> None           (async)
-    │   ├── start() -> None                (async, concrete)
-    │   └── run() -> None                  (abstract, async)
+    │   ├── inbox:     asyncio.Queue[Message]
+    │   ├── outbox:    asyncio.Queue[Message]
+    │   ├── log_queue: asyncio.Queue[Message] | None
+    │   ├── get_item() -> Message              (async)
+    │   ├── put_item(msg) -> None              (async)
+    │   ├── _wait_for_resume() -> None         (async)
+    │   ├── start() -> None                   (async, concrete)
+    │   └── run() -> None                     (abstract, async)
     │
     ├── SchedulerThreadTask
-    │   ├── inbox:  queue.Queue[Message]
-    │   ├── outbox: queue.Queue[Message]
+    │   ├── inbox:     queue.Queue[Message]
+    │   ├── outbox:    queue.Queue[Message]
+    │   ├── log_queue: queue.Queue[Message] | None
     │   ├── _stop_event: threading.Event
     │   ├── get_item(timeout=None) -> Message | None   (sync)
     │   ├── put_item(msg) -> None                      (sync)
+    │   ├── _wait_for_resume() -> bool                 (sync)
     │   ├── start() -> None                            (async, concrete)
     │   └── run() -> None                              (abstract, sync)
     │
     └── SchedulerProcessTask
-        ├── inbox:  Manager().Queue proxy   (set by start())
-        ├── outbox: Manager().Queue proxy   (set by start())
+        ├── inbox:     Manager().Queue proxy   (set by start())
+        ├── outbox:    Manager().Queue proxy   (set by start())
+        ├── log_queue: Manager().Queue proxy | None
         ├── _pre_inbox: list[str]
         ├── __getstate__() -> dict
         ├── __setstate__(state) -> None
         ├── feed(msg) -> None
         ├── get_item(timeout=None) -> Message   (sync)
         ├── put_item(msg) -> None               (sync)
+        ├── _wait_for_resume() -> bool          (sync)
         ├── start() -> None                     (async, concrete)
         └── run() -> None                       (abstract, sync)
 
+    SchedulerProcessPoolTask                  coordination/scheduler.py
+        ├── num_workers: int                  (default 4)
+        ├── inbox:     Manager().Queue proxy   (pool controller inbox, set by start())
+        ├── outbox:    Manager().Queue proxy   (shared result queue,  set by start())
+        ├── _pre_inbox: list[str]
+        ├── __getstate__() -> dict
+        ├── __setstate__(state) -> None
+        ├── feed(msg) -> None
+        ├── get_item(timeout=None) -> Message   (sync, called by workers)
+        ├── put_item(msg) -> None               (sync, called by workers)
+        ├── _wait_for_resume() -> bool          (sync, called by workers)
+        ├── _run_controller(pool_inbox, work_q) (routes lifecycle signals)
+        ├── start() -> None                     (async, concrete)
+        └── run() -> None                       (abstract, sync — runs in each worker)
+
 SchedulerManager                          coordination/scheduler.py
 ├── name: str
+├── concurrent: bool   (default True — asyncio.gather)
 ├── status: Status      (property)
 ├── tasks: list[SchedulerTask]  (property)
 ├── add(task) -> None
@@ -88,19 +122,27 @@ BaseCoordinationTask (ABC)                coordination/base.py
 
 ## Execution Strategies
 
-| Strategy  | Scheduler class          | Queue type                          | Executor             |
-|-----------|--------------------------|-------------------------------------|----------------------|
-| Coroutine | `SchedulerAsyncTask`     | `asyncio.Queue`                     | isolated thread+loop |
-| Thread    | `SchedulerThreadTask`    | `queue.Queue`                       | `ThreadPoolExecutor` |
-| Process   | `SchedulerProcessTask`   | `multiprocessing.Manager().Queue()` | `ProcessPoolExecutor`|
+| Strategy     | Scheduler class               | Queue type                          | Executor              |
+|--------------|-------------------------------|-------------------------------------|-----------------------|
+| Coroutine    | `SchedulerAsyncTask`          | `asyncio.Queue`                     | isolated thread+loop  |
+| Thread       | `SchedulerThreadTask`         | `queue.Queue`                       | `ThreadPoolExecutor`  |
+| Process      | `SchedulerProcessTask`        | `multiprocessing.Manager().Queue()` | `ProcessPoolExecutor` |
+| Process pool | `SchedulerProcessPoolTask`    | `multiprocessing.Manager().Queue()` | N `Process` objects   |
 
-All three are driven by `SchedulerManager.run_all()` which calls `task.start()`
-sequentially, awaiting each to completion before starting the next.
+`SchedulerManager.run_all()` runs all tasks **concurrently** by default
+(`concurrent=True`, backed by `asyncio.gather`).  Pass `concurrent=False` for
+sequential execution.
 
 > **Process queue note:** Plain `multiprocessing.Queue` cannot be pickled and
-> therefore cannot be passed to a `ProcessPoolExecutor` worker.
+> therefore cannot be passed across the process boundary.
 > `multiprocessing.Manager().Queue()` returns a picklable proxy backed by a
 > manager server process, solving the cross-process boundary problem.
+
+> **Spawn cost note:** `SchedulerProcessTask` spawns one OS process per
+> `start()` call (≈ 100–300 ms overhead).  `SchedulerProcessPoolTask`
+> pre-spawns *num_workers* processes once; they live until a STOP / SHUTDOWN
+> signal is received, eliminating per-task spawn cost for high-throughput
+> workloads.
 
 ---
 
@@ -109,25 +151,29 @@ sequentially, awaiting each to completion before starting the next.
 ```
 AdvTemplate/
 │
-├── main.py                       # Async entry point; wires tasks + SchedulerManager
-├── customtypes.py                # Message, TaskConfig, TaskKind, MessageKind, ControlSignal
+├── main.py                        # Async entry point — three-phase RSS pipeline
+├── customtypes.py                 # Message, TaskConfig, TaskKind, MessageKind, ControlSignal
+├── rssfeeds_working.conf          # JSON array of RSS feed URLs
 │
 ├── coordination/
-│   ├── __init__.py               # Re-exports public classes
-│   ├── scheduler.py              # SchedulerTask ABC, three subclasses, SchedulerManager
-│   ├── base.py                   # BaseCoordinationTask (used by child tasks)
-│   ├── coroutine_task.py         # CoroutineCoordinationTask
-│   ├── thread_task.py            # ThreadCoordinationTask
-│   └── process_task.py           # ProcessCoordinationTask
+│   ├── __init__.py                # Re-exports public classes
+│   ├── scheduler.py               # SchedulerTask ABC, three subclasses, SchedulerManager
+│   ├── base.py                    # BaseCoordinationTask (used by child tasks)
+│   ├── coroutine_task.py          # CoroutineCoordinationTask
+│   ├── thread_task.py             # ThreadCoordinationTask
+│   └── process_task.py            # ProcessCoordinationTask
 │
 ├── examples/
 │   ├── __init__.py
-│   ├── example_coroutine.py      # ExampleCoroutineTask (+ _ChildCoroutineTask)
-│   ├── example_thread.py         # ExampleThreadTask    (+ _ChildThreadTask)
-│   └── example_process.py        # ExampleProcessTask   (+ _ChildProcessTask)
+│   ├── example_coroutine.py       # ExampleCoroutineTask (+ _ChildCoroutineTask)
+│   ├── example_thread.py          # ExampleThreadTask    (+ _ChildThreadTask)
+│   ├── example_process.py         # ExampleProcessTask   (+ _ChildProcessTask)
+    ├── example_all_tasks.py       # All four strategies in a single concurrent demo
+    ├── example_process_pool.py    # Persistent-worker pool demo (SchedulerProcessPoolTask)
+│   └── example_rss_demo.py        # RSSFetchTask, RSSParserTask, APIServerTask
 │
 └── docs/
-    └── ARCHITECTURE.md           # This document
+    └── ARCHITECTURE.md            # This document
 ```
 
 ---
@@ -167,10 +213,15 @@ by `SchedulerProcessTask.get_item()` / `put_item()` to cross the process boundar
 
 ### Control signals (`ControlSignal` enum)
 
-`START`, `STOP`, `PAUSE`, `RESUME`, `SHUTDOWN`
+| Signal     | Meaning                                         |
+|------------|-------------------------------------------------|
+| `STOP`     | Finish current work, then exit cleanly          |
+| `SHUTDOWN` | Exit immediately without draining               |
+| `PAUSE`    | Suspend DATA processing until RESUME arrives    |
+| `RESUME`   | Resume after a PAUSE                            |
 
-Stop detection: `SchedulerTask._is_stop_signal(msg)` returns `True` when
-`msg.kind == CONTROL` and `msg.payload["signal"] == "stop"`.
+Detection helpers (all `staticmethod` on `SchedulerTask`):
+`_is_stop_signal`, `_is_shutdown_signal`, `_is_pause_signal`, `_is_resume_signal`.
 
 ---
 
@@ -198,7 +249,134 @@ event loop. The caller awaits it via `run_in_executor(None, thread.join)`.
 ```
 
 After the thread joins, `start()` drains `outbox` into `task.results`
-automatically. `main.py` only reads `task.results` — no manual queue draining.
+automatically (unless an external outbox was injected). `main.py` only reads
+`task.results` — no manual queue draining.
+
+---
+
+## Concurrent Manager — Pipeline Topology
+
+When `SchedulerManager(concurrent=True)` (the default), `run_all()` uses
+`asyncio.gather` so all tasks start simultaneously:
+
+```
+await asyncio.gather(task_a.start(), task_b.start(), task_c.start())
+```
+
+This is required whenever tasks are wired into a pipeline and would otherwise
+deadlock waiting on each other's queues.
+
+To wire tasks into a pipeline, inject shared queues at construction:
+
+```python
+q_in  = asyncio.Queue()   # or queue.Queue for thread tasks
+q_out = asyncio.Queue()
+
+task_a = ProducerTask(name="producer", outbox=q_in)
+task_b = ConsumerTask(name="consumer", inbox=q_in, outbox=q_out)
+```
+
+---
+
+## Process Pool — Persistent Worker Pattern
+
+`SchedulerProcessPoolTask` is the right choice when spawn overhead dominates
+or when a queue of many small jobs must be processed by parallel workers.
+
+```
+external inbox (pool controller)
+     ┌────────────────┐
+     │ pool controller │  ← PAUSE/RESUME buffer
+     └────────────────┘
+             │   STOP/SHUTDOWN → broadcast N pills
+             ▼   DATA → forward
+        work_queue (shared)
+     ┌───────▼───────┐
+     │               │
+   worker-0  worker-1  …  worker-N (each runs self.run())
+     │               │
+     └─────▼──────┘
+         result_queue
+             │
+         task.results  (drained by start())
+```
+
+| Concern | Behaviour |
+|---|---|
+| Spawn | Workers spawned **once** at `start()`; no re-spawn between jobs |
+| Load balancing | OS-level — workers compete on the shared work queue |
+| Shutdown | Send **one** `STOP` / `SHUTDOWN` to the pool; controller broadcasts N pills |
+| PAUSE/RESUME | Controller buffers messages; workers are not notified |
+| Pickling | `run()` executes in subprocess — all attributes must be picklable; logger excluded via `__getstate__` / `__setstate__` |
+| Pre-feed | Use `pool.feed(msg)` (same as `SchedulerProcessTask`) |
+
+---
+
+## Lifecycle / PAUSE-RESUME Pattern
+
+The recommended `run()` loop for all three task types:
+
+```python
+# Async
+async def run(self) -> None:
+    while True:
+        msg = await self.get_item()
+        if self._is_shutdown_signal(msg): break
+        if self._is_stop_signal(msg):     break
+        if self._is_pause_signal(msg):
+            await self._wait_for_resume()
+            continue
+        # … process msg …
+
+# Thread / Process
+def run(self) -> None:
+    while not self._stop_event.is_set():   # thread only
+        msg = self.get_item(timeout=0.5)
+        if msg is None: continue           # timeout — poll stop_event
+        if self._is_shutdown_signal(msg): break
+        if self._is_stop_signal(msg):     break
+        if self._is_pause_signal(msg):
+            self._wait_for_resume()
+            continue
+        # … process msg …
+```
+
+`_wait_for_resume()` blocks the task's own thread/process until RESUME (or
+SHUTDOWN) arrives — the main event loop and all other tasks remain unaffected.
+
+---
+
+## RSS Pipeline — Reference Implementation
+
+`main.py` and `examples/example_rss_demo.py` demonstrate a realistic three-
+phase pipeline:
+
+```
+rssfeeds_working.conf
+        │
+        ▼
+╔══════════════════════════════════════════╗
+║  Phase 1 — RSSFetchTask                 ║  SchedulerAsyncTask
+║  aiohttp: all URLs fetched concurrently  ║  isolated thread + loop
+║  → tmp/raw/<hash>.xml                    ║
+╚══════════════════════════════════════════╝
+        │  task.results → list[Message{filepath, url}]
+        ▼
+╔══════════════════════════════════════════╗
+║  Phase 2 — RSSParserTask                ║  SchedulerProcessTask
+║  XML parsing in a subprocess (CPU-bound) ║  ProcessPoolExecutor
+║  RSS 2.0 + Atom 1.0 supported           ║
+║  → tmp/processed/<hash>.json            ║
+╚══════════════════════════════════════════╝
+        │  task.results → list[Message{source, title, items, output}]
+        ▼
+╔══════════════════════════════════════════╗
+║  Phase 3 — APIServerTask                ║  SchedulerThreadTask
+║  FastAPI + uvicorn in a daemon thread    ║  ThreadPoolExecutor
+║  GET /  /feeds  /items  /items/{idx}    ║
+║  Stopped by STOP signal from main loop  ║
+╚══════════════════════════════════════════╝
+```
 
 ---
 
@@ -254,6 +432,7 @@ SchedulerTask.run()  ──►  (optional) child task via BaseCoordinationTask
 SchedulerTask.outbox
   │
   │  drained automatically by start() into task.results
+  │  (skipped if outbox was externally injected — pipeline mode)
   ▼
 main.py  reads task.results
 ```
@@ -272,8 +451,11 @@ class MyTask(SchedulerAsyncTask):
     async def run(self) -> None:
         while True:
             msg = await self.get_item()
-            if self._is_stop_signal(msg):
-                break
+            if self._is_shutdown_signal(msg): break
+            if self._is_stop_signal(msg):     break
+            if self._is_pause_signal(msg):
+                await self._wait_for_resume()
+                continue
             await self.put_item(
                 Message.result(sender=self.name, payload={"ok": True})
             )
@@ -298,6 +480,13 @@ proc_task = MyProcessTask(name="proc-task", log_level="DEBUG")
 proc_task.feed(Message.data(sender="main", payload={"x": 1}))
 proc_task.feed(Message.control(sender="main", signal=ControlSignal.STOP))
 manager.add(proc_task)
+
+# Process pool: use feed(); one STOP broadcasts to all workers automatically
+pool_task = MyPoolTask(name="pool-task", num_workers=4, log_level="DEBUG")
+for i in range(20):
+    pool_task.feed(Message.data(sender="main", payload={"x": i}))
+pool_task.feed(Message.control(sender="main", signal=ControlSignal.STOP))
+manager.add(pool_task)
 ```
 
 ### 3. Run and read results
@@ -326,4 +515,7 @@ Spawn children inside `run()` using `BaseCoordinationTask` subclasses
 * **Loop isolation** — `SchedulerAsyncTask` runs in a dedicated thread+loop, fully isolated from the caller's loop.
 * **No log leakage** — task loggers set `propagate = False` to prevent duplicate log output across loop/thread boundaries.
 * **Automatic result collection** — `start()` drains the outbox into `task.results`; callers never touch queues directly.
-* **Process-safe queuing** — `SchedulerProcessTask` uses `multiprocessing.Manager().Queue()` proxies and excludes the logger from pickling via `__getstate__`/`__setstate__`.
+* **Process-safe queuing** — `SchedulerProcessTask` and `SchedulerProcessPoolTask` use `multiprocessing.Manager().Queue()` proxies and exclude the logger from pickling via `__getstate__`/`__setstate__`.
+* **Zero spawn overhead option** — `SchedulerProcessPoolTask` pre-spawns *N* persistent workers; only one STOP signal is needed regardless of pool size.
+* **Runnable from any directory** — all examples insert the project root into `sys.path` via `Path(__file__).resolve().parents[1]`.
+

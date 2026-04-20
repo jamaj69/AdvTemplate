@@ -2,15 +2,28 @@
 """
 main.py
 =======
-Entry point for the AdvTemplate async coordination system.
+Realistic RSS aggregator pipeline using all three AdvTemplate task types.
 
-Demonstrates all three execution strategies wired as **independent tasks**
-(not a cross-strategy pipeline — each strategy demo is self-contained) but
-running with the new lifecycle-aware pattern: PAUSE, RESUME, STOP, SHUTDOWN.
+Three-phase sequential pipeline
+--------------------------------
+Phase 1 — RSSFetchTask  (SchedulerAsyncTask)
+    Reads every URL from ``rssfeeds_working.conf`` and fetches them **all in
+    parallel** with ``aiohttp``.  Raw XML is saved to ``tmp/raw/``.
 
-Each task accepts its queues from outside, making it trivial to wire multiple
-tasks of the same strategy into a pipeline.  ``main()`` only needs to supply
-messages and read results.
+Phase 2 — RSSParserTask  (SchedulerProcessTask)
+    Receives file paths from Phase 1, parses each RSS / Atom feed inside a
+    dedicated subprocess, and writes structured JSON to ``tmp/processed/``.
+
+Phase 3 — APIServerTask  (SchedulerThreadTask)
+    Starts a FastAPI / uvicorn HTTP server in a background thread and serves
+    the processed data for ``API_SECS`` seconds (configurable below).
+
+    Endpoints::
+
+        GET /              server status
+        GET /feeds         list of all parsed feeds
+        GET /items         all news items  (?source= &limit=)
+        GET /items/{idx}   single item by 0-based global index
 
 Run
 ---
@@ -23,12 +36,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from coordination.scheduler import SchedulerManager
 from customtypes import ControlSignal, Message
-from examples.example_coroutine import ExampleCoroutineTask
-from examples.example_thread import ExampleThreadTask
-from examples.example_process import ExampleProcessTask
+from examples.example_rss_demo import APIServerTask, RSSFetchTask, RSSParserTask
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ROOT      = Path(__file__).parent
+CONF_FILE = ROOT / "rssfeeds_working.conf"
+TMP_DIR   = ROOT / "tmp"
+API_PORT  = 8000
+API_SECS  = 60          # seconds to keep the API server running
 
 
 # ---------------------------------------------------------------------------
@@ -49,105 +72,115 @@ logger = logging.getLogger("main")
 
 async def main() -> None:
     """
-    Top-level async coordinator.
+    Three-phase RSS aggregator pipeline.
 
-    Each demo section shows how to wire a task's queues externally (for
-    pipeline use) and how PAUSE/RESUME/STOP signals are delivered.
+    Each phase uses a different execution strategy and a fresh
+    :class:`SchedulerManager`.  Phases are sequential because each one
+    produces data consumed by the next.
 
-    All three tasks are registered with a single :class:`SchedulerManager`
-    that runs them **sequentially** (each demo waits for the previous to
-    finish).  Within each demo the task itself runs concurrently with the
-    main coroutine feeding its inbox.
+    * The **parallelism** inside Phase 1 comes from ``aiohttp`` running all
+      HTTP requests as concurrent coroutines within the isolated asyncio loop
+      of the ``SchedulerAsyncTask``.
+    * The **CPU isolation** in Phase 2 comes from the ``SchedulerProcessTask``
+      running XML parsing in a separate OS process.
+    * The **non-blocking I/O** in Phase 3 comes from the ``SchedulerThreadTask``
+      keeping the FastAPI / uvicorn server in a background thread while the
+      main asyncio loop drives the shutdown timer.
     """
 
-    # -----------------------------------------------------------------------
-    # Coroutine task demo (with PAUSE / RESUME)
-    # -----------------------------------------------------------------------
-    logger.info("=== Coroutine mode ===")
+    # ── Phase 1 — Fetch  (SchedulerAsyncTask) ────────────────────────────
+    # All HTTP requests run as concurrent coroutines inside a single aiohttp
+    # session.  The task exits on its own once every URL has been processed.
+    logger.info("════ Phase 1 — Fetch RSS feeds (AsyncTask) ════")
 
-    coro_inbox:  asyncio.Queue[Message] = asyncio.Queue()
-    coro_outbox: asyncio.Queue[Message] = asyncio.Queue()
-    coro_log_q:  asyncio.Queue[Message] = asyncio.Queue()
+    fetch_task = RSSFetchTask(
+        name="rss-fetch",
+        feeds_conf=CONF_FILE,
+        tmp_dir=TMP_DIR,
+        log_level="INFO",
+    )
+    m1 = SchedulerManager(name="phase1-fetch", concurrent=False)
+    m1.add(fetch_task)
+    await m1.run_all()
 
-    coroutine_task = ExampleCoroutineTask(
-        name="coroutine-task-1",
-        log_level="DEBUG",
-        inbox=coro_inbox,
-        outbox=coro_outbox,
-        log_queue=coro_log_q,
+    ok_results = [r for r in fetch_task.results if r.payload.get("ok")]
+    logger.info(
+        "Phase 1 done — %d/%d feeds saved to %s/raw/",
+        len(ok_results), len(fetch_task.results), TMP_DIR,
     )
 
-    # Pre-feed inbox before starting — SchedulerAsyncTask runs in an
-    # isolated event loop (separate thread), so messages must be queued
-    # before run_all() is called.
-    for i in range(3):
-        coro_inbox.put_nowait(Message.data(sender="main", payload={"index": i}))
-    coro_inbox.put_nowait(Message.control(sender="main", signal=ControlSignal.STOP))
+    # ── Phase 2 — Parse  (SchedulerProcessTask) ──────────────────────────
+    # File paths from Phase 1 are pre-fed into the process task before
+    # start().  The task runs XML parsing in a dedicated subprocess, then
+    # writes structured JSON to tmp/processed/.
+    logger.info("════ Phase 2 — Parse feeds (ProcessTask) ════")
 
-    coro_manager = SchedulerManager(name="coro-demo", concurrent=False)
-    coro_manager.add(coroutine_task)
-    await coro_manager.run_all()
+    parse_task = RSSParserTask(
+        name="rss-parse",
+        tmp_dir=TMP_DIR,
+        log_level="INFO",
+    )
+    for result in ok_results:
+        parse_task.feed(
+            Message.data(
+                sender="main",
+                payload={
+                    "filepath": result.payload["filepath"],
+                    "url":      result.payload["url"],
+                },
+            )
+        )
+    parse_task.feed(Message.control(sender="main", signal=ControlSignal.STOP))
 
-    logger.info("Coroutine task results:")
-    while not coro_outbox.empty():
-        msg = coro_outbox.get_nowait()
-        logger.info("  %s", msg.payload)
+    m2 = SchedulerManager(name="phase2-parse", concurrent=False)
+    m2.add(parse_task)
+    await m2.run_all()
 
-    # Log messages collected from log_queue
-    while not coro_log_q.empty():
-        lmsg = coro_log_q.get_nowait()
-        logger.debug("  [LOG] %s", lmsg.payload)
-
-    # -----------------------------------------------------------------------
-    # Thread task demo (with PAUSE / RESUME)
-    # -----------------------------------------------------------------------
-    logger.info("=== Thread mode ===")
-
-    import queue as _queue
-    thread_inbox  = _queue.Queue()
-    thread_outbox = _queue.Queue()
-    thread_log_q  = _queue.Queue()
-
-    thread_task = ExampleThreadTask(
-        name="thread-task-1",
-        log_level="DEBUG",
-        inbox=thread_inbox,
-        outbox=thread_outbox,
-        log_queue=thread_log_q,
+    total_items = sum(r.payload.get("items", 0) for r in parse_task.results)
+    logger.info(
+        "Phase 2 done — %d feeds parsed, %d total items → %s/processed/",
+        len(parse_task.results), total_items, TMP_DIR,
     )
 
-    # Pre-feed: DATA, PAUSE, RESUME, DATA, STOP
-    for i in range(2):
-        thread_inbox.put(Message.data(sender="main", payload={"index": i}))
-    thread_inbox.put(Message.control(sender="main", signal=ControlSignal.PAUSE))
-    thread_inbox.put(Message.control(sender="main", signal=ControlSignal.RESUME))
-    thread_inbox.put(Message.data(sender="main", payload={"index": 99}))
-    thread_inbox.put(Message.control(sender="main", signal=ControlSignal.STOP))
+    # ── Phase 3 — Serve  (SchedulerThreadTask) ────────────────────────────
+    # FastAPI + uvicorn run in a background daemon thread.  A concurrent
+    # stopper coroutine sends STOP after API_SECS seconds while the main
+    # event loop stays free — proving the thread is fully isolated.
+    logger.info("════ Phase 3 — Serve API (ThreadTask, %d s) ════", API_SECS)
 
-    thread_manager = SchedulerManager(name="thread-demo", concurrent=False)
-    thread_manager.add(thread_task)
-    await thread_manager.run_all()
+    api_task = APIServerTask(
+        name="rss-api",
+        tmp_dir=TMP_DIR,
+        port=API_PORT,
+        log_level="INFO",
+    )
+    m3 = SchedulerManager(name="phase3-api", concurrent=False)
+    m3.add(api_task)
 
-    logger.info("Thread task results:")
-    while not thread_outbox.empty():
-        msg = thread_outbox.get_nowait()
+    async def _stopper() -> None:
+        logger.info(
+            "API will serve for %d s — visit http://127.0.0.1:%d",
+            API_SECS, API_PORT,
+        )
+        await asyncio.sleep(API_SECS)
+        logger.info("stopping API server …")
+        api_task.inbox.put(
+            Message.control(sender="main", signal=ControlSignal.STOP)
+        )
+
+    await asyncio.gather(m3.run_all(), _stopper())
+    logger.info("All phases complete.")
+
+    # -- Results -------------------------------------------------------------
+    logger.info("--- async-task results (doubled) ---")
+    for msg in async_task.results:
         logger.info("  %s", msg.payload)
 
-    # -----------------------------------------------------------------------
-    # Process task demo (standard — no injected queues; uses feed() + drain)
-    # -----------------------------------------------------------------------
-    logger.info("=== Process mode ===")
+    logger.info("--- thread-task results (tripled) ---")
+    for msg in thread_task.results:
+        logger.info("  %s", msg.payload)
 
-    process_task = ExampleProcessTask(name="process-task-1", log_level="DEBUG")
-    for i in range(3):
-        process_task.feed(Message.data(sender="main", payload={"index": i}))
-    process_task.feed(Message.control(sender="main", signal=ControlSignal.STOP))
-
-    proc_manager = SchedulerManager(name="proc-demo", concurrent=False)
-    proc_manager.add(process_task)
-    await proc_manager.run_all()
-
-    logger.info("Process task results:")
+    logger.info("--- process-task results (squared) ---")
     for msg in process_task.results:
         logger.info("  %s", msg.payload)
 

@@ -9,12 +9,14 @@ protocol.
 
 ## Features
 
-- **Three execution strategies**, each as a concrete `SchedulerTask` subclass:
+- **Four execution strategies**, each as a concrete `SchedulerTask` subclass:
   - `SchedulerAsyncTask` — pure `asyncio` coroutines in an isolated loop
   - `SchedulerThreadTask` — synchronous body in a `ThreadPoolExecutor`
   - `SchedulerProcessTask` — synchronous body in a `ProcessPoolExecutor`
+  - `SchedulerProcessPoolTask` — N persistent worker processes; zero per-task spawn cost
 - **Uniform API** — every task exposes `start()`, `run()`, `log()`,
   `get_item()`, and `put_item()` regardless of strategy.
+- **Full lifecycle signals** — STOP, SHUTDOWN, PAUSE, RESUME handled uniformly.
 - **Self-contained tasks** — each task owns its queues, executor, and
   serialisation; `main.py` only feeds messages and reads `task.results`.
 - **Typed messages** — all communication uses `Message` dataclasses serialised
@@ -31,7 +33,11 @@ protocol.
 ## Requirements
 
 - Python 3.11+
-- No third-party dependencies (standard library only)
+- Standard-library-only core (no third-party deps required)
+- Optional for the RSS demo: `aiohttp`, `fastapi`, `uvicorn`
+  ```bash
+  pip install aiohttp fastapi uvicorn
+  ```
 
 ---
 
@@ -42,25 +48,28 @@ protocol.
 git clone https://github.com/<your-username>/AdvTemplate.git
 cd AdvTemplate
 
-# Run the demo
+# (Optional) install deps for the RSS demo
+pip install aiohttp fastapi uvicorn
+
+# Run the RSS aggregator demo
 python main.py
 ```
 
-Expected output:
+The demo runs a three-phase pipeline:
+
+| Phase | Task | Strategy | What it does |
+|---|---|---|---|
+| 1 | `RSSFetchTask` | `SchedulerAsyncTask` | Fetches all feeds from `rssfeeds_working.conf` concurrently with `aiohttp`; saves raw XML to `tmp/raw/` |
+| 2 | `RSSParserTask` | `SchedulerProcessTask` | Parses RSS 2.0 / Atom feeds in a subprocess; writes structured JSON to `tmp/processed/` |
+| 3 | `APIServerTask` | `SchedulerThreadTask` | Serves the parsed data via FastAPI on port 8000 for 60 s |
+
+**API endpoints** (while Phase 3 is running):
 
 ```
-2026-04-16T12:00:00 [INFO] main: === Coroutine mode ===
-...
-2026-04-16T12:00:00 [INFO] main: coroutine-task-1 result: {'index': 0, 'doubled': 0}
-...
-2026-04-16T12:00:00 [INFO] main: === Thread mode ===
-...
-2026-04-16T12:00:00 [INFO] main: thread-task-1 result: {'index': 0, 'tripled': 0}
-...
-2026-04-16T12:00:00 [INFO] main: === Process mode ===
-...
-2026-04-16T12:00:00 [INFO] main: process-task-1 result: {'index': 0, 'squared': 0}
-2026-04-16T12:00:00 [INFO] main: Manager 'demo-manager' status: done
+GET /              → server status  (feed count, total_items)
+GET /feeds         → list of all parsed feeds
+GET /items         → all news items  (?source=bbc &limit=20)
+GET /items/{idx}   → single item by 0-based global index
 ```
 
 ---
@@ -69,21 +78,44 @@ Expected output:
 
 ```
 AdvTemplate/
-├── main.py                       # Entry point; builds SchedulerManager, feeds messages
-├── customtypes.py                # Shared types & message protocol
+├── main.py                        # Entry point — three-phase RSS pipeline
+├── customtypes.py                 # Shared types & message protocol
+├── rssfeeds_working.conf          # JSON array of RSS feed URLs
 ├── coordination/
-│   ├── base.py                   # BaseCoordinationTask (for internal child tasks)
-│   ├── coroutine_task.py         # CoroutineCoordinationTask (child tasks)
-│   ├── thread_task.py            # ThreadCoordinationTask   (child tasks)
-│   ├── process_task.py           # ProcessCoordinationTask  (child tasks)
-│   └── scheduler.py             # SchedulerTask ABC + subclasses + SchedulerManager
+│   ├── base.py                    # BaseCoordinationTask (for internal child tasks)
+│   ├── coroutine_task.py          # CoroutineCoordinationTask (child tasks)
+│   ├── thread_task.py             # ThreadCoordinationTask   (child tasks)
+│   ├── process_task.py            # ProcessCoordinationTask  (child tasks)
+│   └── scheduler.py              # SchedulerTask ABC + subclasses + SchedulerManager
 ├── examples/
-│   ├── example_coroutine.py      # ExampleCoroutineTask  ← SchedulerAsyncTask
-│   ├── example_thread.py         # ExampleThreadTask     ← SchedulerThreadTask
-│   └── example_process.py        # ExampleProcessTask    ← SchedulerProcessTask
+│   ├── example_coroutine.py       # ExampleCoroutineTask  ← SchedulerAsyncTask
+│   ├── example_thread.py          # ExampleThreadTask     ← SchedulerThreadTask
+│   ├── example_process.py         # ExampleProcessTask    ← SchedulerProcessTask
+    ├── example_all_tasks.py       # All four strategies in one concurrent demo
+    ├── example_process_pool.py    # Persistent-worker pool demo (SchedulerProcessPoolTask)
+│   └── example_rss_demo.py        # RSSFetchTask, RSSParserTask, APIServerTask
 └── docs/
-    └── ARCHITECTURE.md           # Full architecture documentation
+    └── ARCHITECTURE.md            # Full architecture documentation
 ```
+
+---
+
+## Running the Examples
+
+```bash
+# All-strategies concurrent demo (no external deps)
+python examples/example_all_tasks.py
+
+# Persistent process-pool demo (no external deps)
+python examples/example_process_pool.py
+
+# RSS aggregator pipeline (requires aiohttp + fastapi + uvicorn)
+python examples/example_rss_demo.py
+# or simply:
+python main.py
+```
+
+All examples resolve their own imports and can be run from any directory.
 
 ---
 
@@ -102,6 +134,9 @@ AdvTemplate/
                 msg = await self.get_item()
                 if self._is_stop_signal(msg):
                     break
+                if self._is_pause_signal(msg):
+                    await self._wait_for_resume()
+                    continue
                 await self.put_item(
                     Message.result(sender=self.name, payload={"status": "ok"})
                 )
@@ -129,6 +164,11 @@ AdvTemplate/
         print(msg.payload)
     ```
 
+> For `SchedulerProcessTask` and `SchedulerProcessPoolTask`, use `task.feed(msg)`
+> instead of `task.inbox.put_nowait(msg)` — the Manager queue does not exist until
+> `start()` creates it.  For a pool, only **one** STOP signal is needed — the pool
+> controller broadcasts a poison pill to every worker automatically.
+
 ---
 
 ## Message Protocol
@@ -149,6 +189,15 @@ msg2 = Message.from_json(json_str)
 | `payload`        | `Any`         | JSON-serialisable content             |
 | `correlation_id` | `str \| None` | Links requests to responses           |
 | `timestamp`      | `str`         | ISO-8601 UTC creation time            |
+
+### Lifecycle control signals
+
+| Signal     | Meaning                                         |
+|------------|-------------------------------------------------|
+| `STOP`     | Finish current work, then exit cleanly          |
+| `SHUTDOWN` | Exit immediately without draining               |
+| `PAUSE`    | Suspend DATA processing until RESUME arrives    |
+| `RESUME`   | Resume after a PAUSE                            |
 
 ---
 

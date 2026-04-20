@@ -23,6 +23,12 @@ and are internal implementation details of the parent coordinator.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure the project root is on sys.path when the script is run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import asyncio
 
 from customtypes import ControlSignal, Message, TaskConfig, TaskKind

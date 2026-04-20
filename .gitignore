@@ -22,3 +22,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime artifacts
+tmp/
+*.log
