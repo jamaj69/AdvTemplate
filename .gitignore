@@ -26,3 +26,4 @@ Thumbs.db
 # Runtime artifacts
 tmp/
 *.log
+*.json
