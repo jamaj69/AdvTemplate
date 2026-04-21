@@ -44,7 +44,7 @@ import multiprocessing
 import queue
 import threading
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Literal
 
 from customtypes import ControlSignal, Message, MessageKind
