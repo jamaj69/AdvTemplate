@@ -7,7 +7,7 @@ Realistic RSS aggregator pipeline using all three AdvTemplate task types.
 Three-phase sequential pipeline
 --------------------------------
 Phase 1 — RSSFetchTask  (SchedulerAsyncTask)
-    Reads every URL from ``rssfeeds_working.conf`` and fetches them **all in
+    Reads every URL from ``rssfeeds.conf`` and fetches them **all in
     parallel** with ``aiohttp``.  Raw XML is saved to ``tmp/raw/``.
 
 Phase 2 — RSSParserTask  (SchedulerProcessTask)
@@ -48,7 +48,7 @@ from examples.example_rss_demo import APIServerTask, RSSFetchTask, RSSParserTask
 # ---------------------------------------------------------------------------
 
 ROOT      = Path(__file__).parent
-CONF_FILE = ROOT / "rssfeeds_working.conf"
+CONF_FILE = ROOT / "rssfeeds.conf"
 TMP_DIR   = ROOT / "tmp"
 API_PORT  = 8000
 API_SECS  = 60          # seconds to keep the API server running
