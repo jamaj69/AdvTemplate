@@ -488,6 +488,11 @@ class SchedulerThreadTask(SchedulerTask):
         with ThreadPoolExecutor(max_workers=1) as executor:
             try:
                 await loop.run_in_executor(executor, self.run)
+            except asyncio.CancelledError:
+                # Signal the thread to exit its run() loop, then re-raise so
+                # the executor can join() the thread before we propagate.
+                self._stop_event.set()
+                raise
             except BaseException as exc:  # noqa: BLE001
                 self._exc    = exc
                 self._status = "error"
