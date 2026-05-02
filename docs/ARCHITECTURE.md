@@ -3,13 +3,14 @@
 ## Overview
 
 AdvTemplate is a Python skeleton for building **multi-layer async coordination
-systems**. The top-level program (`main.py`) schedules coordination tasks in
-three execution strategies via `SchedulerManager`. Each coordination task can,
-in turn, spawn its own child tasks — creating a two-level (or deeper)
-coordination hierarchy.
+systems**. The top-level program (`main.py`) schedules coordination tasks across
+four execution strategies via `SchedulerManager`: coroutine, thread, process,
+and persistent process pool. Each coordination task can, in turn, spawn its own
+child tasks — creating a two-level (or deeper) coordination hierarchy.
 
 The reference implementation in `main.py` is a realistic **RSS aggregator
-pipeline** that demonstrates all three strategies working together:
+pipeline** that demonstrates the coroutine, process, and thread strategies
+working together:
 
 ```
 Phase 1  RSSFetchTask  (SchedulerAsyncTask)    — concurrent HTTP fetching via aiohttp
@@ -153,11 +154,11 @@ AdvTemplate/
 │
 ├── main.py                        # Async entry point — three-phase RSS pipeline
 ├── customtypes.py                 # Message, TaskConfig, TaskKind, MessageKind, ControlSignal
-├── rssfeeds_working.conf          # JSON array of RSS feed URLs
+├── rssfeeds.conf                  # JSON array of RSS feed URLs
 │
 ├── coordination/
 │   ├── __init__.py                # Re-exports public classes
-│   ├── scheduler.py               # SchedulerTask ABC, three subclasses, SchedulerManager
+│   ├── scheduler.py               # SchedulerTask ABC, strategy subclasses, SchedulerManager
 │   ├── base.py                    # BaseCoordinationTask (used by child tasks)
 │   ├── coroutine_task.py          # CoroutineCoordinationTask
 │   ├── thread_task.py             # ThreadCoordinationTask
@@ -168,8 +169,8 @@ AdvTemplate/
 │   ├── example_coroutine.py       # ExampleCoroutineTask (+ _ChildCoroutineTask)
 │   ├── example_thread.py          # ExampleThreadTask    (+ _ChildThreadTask)
 │   ├── example_process.py         # ExampleProcessTask   (+ _ChildProcessTask)
-    ├── example_all_tasks.py       # All four strategies in a single concurrent demo
-    ├── example_process_pool.py    # Persistent-worker pool demo (SchedulerProcessPoolTask)
+│   ├── example_all_tasks.py       # Async/thread/process in a single concurrent demo
+│   ├── example_process_pool.py    # Persistent-worker pool demo (SchedulerProcessPoolTask)
 │   └── example_rss_demo.py        # RSSFetchTask, RSSParserTask, APIServerTask
 │
 └── docs/
@@ -314,7 +315,7 @@ external inbox (pool controller)
 
 ## Lifecycle / PAUSE-RESUME Pattern
 
-The recommended `run()` loop for all three task types:
+The recommended `run()` loop for scheduler task types:
 
 ```python
 # Async
@@ -352,7 +353,7 @@ SHUTDOWN) arrives — the main event loop and all other tasks remain unaffected.
 phase pipeline:
 
 ```
-rssfeeds_working.conf
+rssfeeds.conf
         │
         ▼
 ╔══════════════════════════════════════════╗
@@ -508,7 +509,7 @@ Spawn children inside `run()` using `BaseCoordinationTask` subclasses
 
 ## Design Principles
 
-* **Consistency** — identical public API (`get_item`, `put_item`, `log`) across all three execution strategies.
+* **Consistency** — identical public API (`get_item`, `put_item`, `log`) across all scheduler execution strategies.
 * **Type safety** — type aliases and annotated dataclasses in `customtypes.py`.
 * **Serialisability** — all messages travel as JSON; no strategy requires shared memory.
 * **Separation of concerns** — `main.py` only schedules; tasks handle their own children.
@@ -518,4 +519,3 @@ Spawn children inside `run()` using `BaseCoordinationTask` subclasses
 * **Process-safe queuing** — `SchedulerProcessTask` and `SchedulerProcessPoolTask` use `multiprocessing.Manager().Queue()` proxies and exclude the logger from pickling via `__getstate__`/`__setstate__`.
 * **Zero spawn overhead option** — `SchedulerProcessPoolTask` pre-spawns *N* persistent workers; only one STOP signal is needed regardless of pool size.
 * **Runnable from any directory** — all examples insert the project root into `sys.path` via `Path(__file__).resolve().parents[1]`.
-

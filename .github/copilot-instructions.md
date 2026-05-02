@@ -2,14 +2,15 @@
 
 ## ⚠️ MANDATORY: Context Restore on Session Start
 
-**Before answering ANY question**, read ALL files below in order to fully restore context:
+**Before answering ANY project question**, read `docs/CONTEXT_RESTORE.md` first.
+Then read the files below as needed for the requested change:
 
 1. `README.md` — project overview and quick-start
 2. `docs/ARCHITECTURE.md` — full class hierarchy, isolated loop model, data flow, design principles
-3. `main.py` — entry point; shows how SchedulerManager + tasks are wired
+3. `main.py` — RSS entry point and current integration state
 4. `customtypes.py` — `Message`, `TaskConfig`, `TaskKind`, type aliases
-5. `coordination/scheduler.py` — `SchedulerTask` ABC, three subclasses, `SchedulerManager`
-6. `coordination/base.py` — `BaseCoordinationTask` (used by internal child tasks)
+5. `coordination/scheduler.py` — scheduler strategies and `SchedulerManager`
+6. `coordination/base.py` — `BaseCoordinationTask` for internal child tasks
 7. `examples/example_*.py` — concrete task implementations
 
 > These files are the single source of truth for architecture, patterns, and conventions.
@@ -19,10 +20,11 @@
 
 ## Project Summary
 
-**AdvTemplate** is a Python (3.11+, stdlib only) template for hierarchical
+**AdvTemplate** is a Python (3.11+, stdlib-only core) template for hierarchical
 async coordination systems. Tasks communicate exclusively through typed,
-JSON-serialisable `Message` objects. Three execution strategies share a
-uniform `get_item()` / `put_item()` / `log()` API.
+JSON-serialisable `Message` objects. Four scheduler strategies share a uniform
+`get_item()` / `put_item()` / `log()` API: coroutine, thread, process, and
+persistent process pool.
 
 ---
 
@@ -48,18 +50,24 @@ SchedulerTask (ABC)                 coordination/scheduler.py
     │   ├── get_item(timeout) / put_item()  — sync
     │   └── start() — ThreadPoolExecutor
     │
-    └── SchedulerProcessTask
+    ├── SchedulerProcessTask
         ├── _pre_inbox: list[str]
         ├── inbox / outbox : Manager().Queue proxy  (set by start())
         ├── feed(msg)  — buffer before start()
         ├── get_item(timeout) / put_item()  — sync, JSON-serialised
         ├── __getstate__ / __setstate__  — pickle-safe
         └── start() — Manager queues + ProcessPoolExecutor
+    │
+    └── SchedulerProcessPoolTask
+        ├── num_workers: int
+        ├── feed(msg)  — buffer before start()
+        ├── controller inbox / worker work queue / shared outbox
+        └── start() — persistent multiprocessing.Process workers
 
 SchedulerManager
 ├── name, status (property), tasks (property)
 ├── add(task), get(name)
-└── run_all()  — calls task.start() sequentially
+└── run_all()  — concurrent by default; pass concurrent=False for sequential phases
 ```
 
 ---
@@ -96,11 +104,12 @@ returns. `main.py` only reads `task.results` — no manual queue draining.
 
 ## Execution Strategy Reference
 
-| Strategy  | Scheduler class          | Queue type                          | Executor             |
-|-----------|--------------------------|-------------------------------------|----------------------|
-| Coroutine | `SchedulerAsyncTask`     | `asyncio.Queue`                     | isolated thread+loop |
-| Thread    | `SchedulerThreadTask`    | `queue.Queue`                       | ThreadPoolExecutor   |
-| Process   | `SchedulerProcessTask`   | `multiprocessing.Manager().Queue()` | ProcessPoolExecutor  |
+| Strategy     | Scheduler class              | Queue type                          | Runtime              |
+|--------------|------------------------------|-------------------------------------|----------------------|
+| Coroutine    | `SchedulerAsyncTask`         | `asyncio.Queue`                     | isolated thread+loop |
+| Thread       | `SchedulerThreadTask`        | `queue.Queue`                       | ThreadPoolExecutor   |
+| Process      | `SchedulerProcessTask`       | `multiprocessing.Manager().Queue()` | ProcessPoolExecutor  |
+| Process pool | `SchedulerProcessPoolTask`   | `multiprocessing.Manager().Queue()` | persistent processes |
 
 ---
 
@@ -151,4 +160,11 @@ for msg in task.results:
 python3 main.py
 # or
 ./main.py
+```
+
+Current note: `main.py` contains a stale result-printing block after the RSS
+pipeline. For the clean RSS demo path, use:
+
+```bash
+python3 examples/example_rss_demo.py
 ```

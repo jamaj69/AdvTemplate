@@ -55,11 +55,16 @@ pip install aiohttp fastapi uvicorn
 python main.py
 ```
 
+> Current note: `main.py` still contains a leftover result-printing block from
+> `examples/example_all_tasks.py` after the RSS pipeline completes. Until that
+> block is removed, prefer `python examples/example_rss_demo.py` for the full
+> RSS demo, or run the focused examples below.
+
 The demo runs a three-phase pipeline:
 
 | Phase | Task | Strategy | What it does |
 |---|---|---|---|
-| 1 | `RSSFetchTask` | `SchedulerAsyncTask` | Fetches all feeds from `rssfeeds_working.conf` concurrently with `aiohttp`; saves raw XML to `tmp/raw/` |
+| 1 | `RSSFetchTask` | `SchedulerAsyncTask` | Fetches all feeds from `rssfeeds.conf` concurrently with `aiohttp`; saves raw XML to `tmp/raw/` |
 | 2 | `RSSParserTask` | `SchedulerProcessTask` | Parses RSS 2.0 / Atom feeds in a subprocess; writes structured JSON to `tmp/processed/` |
 | 3 | `APIServerTask` | `SchedulerThreadTask` | Serves the parsed data via FastAPI on port 8000 for 60 s |
 
@@ -80,22 +85,23 @@ GET /items/{idx}   → single item by 0-based global index
 AdvTemplate/
 ├── main.py                        # Entry point — three-phase RSS pipeline
 ├── customtypes.py                 # Shared types & message protocol
-├── rssfeeds_working.conf          # JSON array of RSS feed URLs
+├── rssfeeds.conf                  # JSON array of RSS feed URLs
 ├── coordination/
 │   ├── base.py                    # BaseCoordinationTask (for internal child tasks)
 │   ├── coroutine_task.py          # CoroutineCoordinationTask (child tasks)
 │   ├── thread_task.py             # ThreadCoordinationTask   (child tasks)
 │   ├── process_task.py            # ProcessCoordinationTask  (child tasks)
-│   └── scheduler.py              # SchedulerTask ABC + subclasses + SchedulerManager
+│   └── scheduler.py               # SchedulerTask ABC + subclasses + SchedulerManager
 ├── examples/
 │   ├── example_coroutine.py       # ExampleCoroutineTask  ← SchedulerAsyncTask
 │   ├── example_thread.py          # ExampleThreadTask     ← SchedulerThreadTask
 │   ├── example_process.py         # ExampleProcessTask    ← SchedulerProcessTask
-    ├── example_all_tasks.py       # All four strategies in one concurrent demo
-    ├── example_process_pool.py    # Persistent-worker pool demo (SchedulerProcessPoolTask)
+│   ├── example_all_tasks.py       # Async/thread/process concurrent demo
+│   ├── example_process_pool.py    # Persistent-worker pool demo
 │   └── example_rss_demo.py        # RSSFetchTask, RSSParserTask, APIServerTask
 └── docs/
-    └── ARCHITECTURE.md            # Full architecture documentation
+    ├── ARCHITECTURE.md            # Full architecture documentation
+    └── CONTEXT_RESTORE.md         # Fast workspace context restore checklist
 ```
 
 ---
@@ -206,9 +212,11 @@ msg2 = Message.from_json(json_str)
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full class hierarchy,
 isolated event loop model, data flow diagrams, and extension guidelines.
 
+For future sessions, start with [docs/CONTEXT_RESTORE.md](docs/CONTEXT_RESTORE.md).
+It is the short, project-specific context restoration file for this workspace.
+
 ---
 
 ## License
 
 MIT
-
