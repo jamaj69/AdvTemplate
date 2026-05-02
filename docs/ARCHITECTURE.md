@@ -8,14 +8,17 @@ four execution strategies via `SchedulerManager`: coroutine, thread, process,
 and persistent process pool. Each coordination task can, in turn, spawn its own
 child tasks — creating a two-level (or deeper) coordination hierarchy.
 
-The reference implementation in `main.py` is a realistic **RSS aggregator
+The reference implementation in `main.py` is a realistic **live RSS aggregator
 pipeline** that demonstrates the coroutine, process, and thread strategies
-working together:
+running together:
 
 ```
-Phase 1  RSSFetchTask  (SchedulerAsyncTask)    — concurrent HTTP fetching via aiohttp
-Phase 2  RSSParserTask (SchedulerProcessTask)  — XML parsing in a subprocess
-Phase 3  APIServerTask (SchedulerThreadTask)   — FastAPI/uvicorn HTTP API in a thread
+RSSFetchTask  (SchedulerAsyncTask)    — concurrent HTTP fetching via aiohttp
+     │ process-safe Message queue
+     ▼
+RSSParserTask (SchedulerProcessTask)  — XML parsing in a subprocess
+
+APIServerTask (SchedulerThreadTask)   — FastAPI/uvicorn HTTP API in a thread
 ```
 
 ---
@@ -152,7 +155,7 @@ sequential execution.
 ```
 AdvTemplate/
 │
-├── main.py                        # Async entry point — three-phase RSS pipeline
+├── main.py                        # Async entry point — live concurrent RSS pipeline
 ├── customtypes.py                 # Message, TaskConfig, TaskKind, MessageKind, ControlSignal
 ├── rssfeeds.conf                  # JSON array of RSS feed URLs
 │
@@ -349,8 +352,16 @@ SHUTDOWN) arrives — the main event loop and all other tasks remain unaffected.
 
 ## RSS Pipeline — Reference Implementation
 
-`main.py` and `examples/example_rss_demo.py` demonstrate a realistic three-
-phase pipeline:
+`main.py` demonstrates a realistic live pipeline. Fetch, parse, and API tasks
+are started by one concurrent `SchedulerManager`; the fetcher streams successful
+files to the parser through a process-safe queue, and the API serves the
+processed directory while both stages are still active.
+
+The process is resident. `RSSFetchTask` repeats every
+`RSS_FETCH_INTERVAL_SECS` seconds, while `RSSParserTask` blocks on its input
+queue and `APIServerTask` blocks on its control queue. `CTRL+C`, `SIGINT`, and
+`SIGTERM` are translated into STOP control messages so every task can exit
+gracefully.
 
 ```
 rssfeeds.conf
@@ -361,7 +372,7 @@ rssfeeds.conf
 ║  aiohttp: all URLs fetched concurrently  ║  isolated thread + loop
 ║  → tmp/raw/<hash>.xml                    ║
 ╚══════════════════════════════════════════╝
-        │  task.results → list[Message{filepath, url}]
+        │  Manager.Queue[Message{filepath, url}]
         ▼
 ╔══════════════════════════════════════════╗
 ║  Phase 2 — RSSParserTask                ║  SchedulerProcessTask
@@ -369,13 +380,11 @@ rssfeeds.conf
 ║  RSS 2.0 + Atom 1.0 supported           ║
 ║  → tmp/processed/<hash>.json            ║
 ╚══════════════════════════════════════════╝
-        │  task.results → list[Message{source, title, items, output}]
-        ▼
 ╔══════════════════════════════════════════╗
 ║  Phase 3 — APIServerTask                ║  SchedulerThreadTask
 ║  FastAPI + uvicorn in a daemon thread    ║  ThreadPoolExecutor
 ║  GET /  /feeds  /items  /items/{idx}    ║
-║  Stopped by STOP signal from main loop  ║
+║  Reads tmp/processed while parse runs    ║
 ╚══════════════════════════════════════════╝
 ```
 

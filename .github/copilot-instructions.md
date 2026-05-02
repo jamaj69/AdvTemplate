@@ -162,9 +162,11 @@ python3 main.py
 ./main.py
 ```
 
-Current note: `main.py` contains a stale result-printing block after the RSS
-pipeline. For the clean RSS demo path, use:
+Current note: `main.py` is the live concurrent RSS pipeline. It starts async
+fetch, process parsing, and threaded API serving together via one concurrent
+`SchedulerManager`. It repeats fetch cycles every `RSS_FETCH_INTERVAL_SECS`
+seconds and exits gracefully on `CTRL+C`, `SIGINT`, or `SIGTERM`.
 
 ```bash
-python3 examples/example_rss_demo.py
+python3 main.py
 ```

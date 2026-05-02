@@ -2,32 +2,23 @@
 """
 main.py
 =======
-Realistic RSS aggregator pipeline using all three AdvTemplate task types.
+Live RSS aggregator pipeline using all three AdvTemplate task types at once.
 
-Three-phase sequential pipeline
---------------------------------
-Phase 1 — RSSFetchTask  (SchedulerAsyncTask)
-    Reads every URL from ``rssfeeds.conf`` and fetches them **all in
-    parallel** with ``aiohttp``.  Raw XML is saved to ``tmp/raw/``.
+The intent of the project is a concurrent coordination graph, not a sequence of
+batch phases.  This entry point starts the fetcher, parser, and API server in
+one ``SchedulerManager(concurrent=True)`` run.  The tasks communicate through
+typed ``Message`` objects carried by queues:
 
-Phase 2 — RSSParserTask  (SchedulerProcessTask)
-    Receives file paths from Phase 1, parses each RSS / Atom feed inside a
-    dedicated subprocess, and writes structured JSON to ``tmp/processed/``.
+* ``RSSFetchTask`` (``SchedulerAsyncTask``) performs I/O-bound HTTP fetches
+  concurrently with ``aiohttp`` and streams each successful file path to a
+  process-safe queue as soon as that feed finishes.
+* ``RSSParserTask`` (``SchedulerProcessTask``) runs in a subprocess and blocks
+  on that queue, parsing files while the fetcher is still fetching the rest.
+* ``APIServerTask`` (``SchedulerThreadTask``) serves ``tmp/processed/*.json``
+  while the pipeline is running and for a short grace period after parsing
+  completes.
 
-Phase 3 — APIServerTask  (SchedulerThreadTask)
-    Starts a FastAPI / uvicorn HTTP server in a background thread and serves
-    the processed data for ``API_SECS`` seconds (configurable below).
-
-    Endpoints::
-
-        GET /              server status
-        GET /feeds         list of all parsed feeds
-        GET /items         all news items  (?source= &limit=)
-        GET /items/{idx}   single item by 0-based global index
-
-Run
----
-::
+Run:
 
     python main.py
 """
@@ -36,6 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
+import os
+import queue
+import signal
 from pathlib import Path
 
 from coordination.scheduler import SchedulerManager
@@ -51,7 +46,7 @@ ROOT      = Path(__file__).parent
 CONF_FILE = ROOT / "rssfeeds.conf"
 TMP_DIR   = ROOT / "tmp"
 API_PORT  = 8000
-API_SECS  = 60          # seconds to keep the API server running
+FETCH_INTERVAL_SECS = float(os.getenv("RSS_FETCH_INTERVAL_SECS", "300"))
 
 
 # ---------------------------------------------------------------------------
@@ -67,122 +62,125 @@ logger = logging.getLogger("main")
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _drain_message_queue(shared_queue) -> list[Message]:
+    messages: list[Message] = []
+    while True:
+        try:
+            raw = shared_queue.get_nowait()
+        except queue.Empty:
+            break
+        except Exception:
+            break
+        messages.append(Message.from_json(raw) if isinstance(raw, str) else raw)
+    return messages
+
+
+# ---------------------------------------------------------------------------
 # Main coroutine
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
     """
-    Three-phase RSS aggregator pipeline.
+    Run the RSS pipeline as concurrent tasks connected by queues.
 
-    Each phase uses a different execution strategy and a fresh
-    :class:`SchedulerManager`.  Phases are sequential because each one
-    produces data consumed by the next.
-
-    * The **parallelism** inside Phase 1 comes from ``aiohttp`` running all
-      HTTP requests as concurrent coroutines within the isolated asyncio loop
-      of the ``SchedulerAsyncTask``.
-    * The **CPU isolation** in Phase 2 comes from the ``SchedulerProcessTask``
-      running XML parsing in a separate OS process.
-    * The **non-blocking I/O** in Phase 3 comes from the ``SchedulerThreadTask``
-      keeping the FastAPI / uvicorn server in a background thread while the
-      main asyncio loop drives the shutdown timer.
+    A ``multiprocessing.Manager().Queue()`` is used between the async fetcher
+    and process parser because it is safe to pickle into the subprocess.  The
+    fetch task streams DATA messages to it and sends one STOP when all fetches
+    have completed, allowing the parser to terminate naturally after draining
+    all queued work.
     """
 
-    # ── Phase 1 — Fetch  (SchedulerAsyncTask) ────────────────────────────
-    # All HTTP requests run as concurrent coroutines inside a single aiohttp
-    # session.  The task exits on its own once every URL has been processed.
-    logger.info("════ Phase 1 — Fetch RSS feeds (AsyncTask) ════")
+    with multiprocessing.Manager() as mp_manager:
+        parse_inbox = mp_manager.Queue()
+        parse_outbox = mp_manager.Queue()
 
-    fetch_task = RSSFetchTask(
-        name="rss-fetch",
-        feeds_conf=CONF_FILE,
-        tmp_dir=TMP_DIR,
-        log_level="INFO",
-    )
-    m1 = SchedulerManager(name="phase1-fetch", concurrent=False)
-    m1.add(fetch_task)
-    await m1.run_all()
+        fetch_task = RSSFetchTask(
+            name="rss-fetch",
+            feeds_conf=CONF_FILE,
+            tmp_dir=TMP_DIR,
+            log_level="INFO",
+            downstream_queue=parse_inbox,
+            emit_stop=True,
+            interval_seconds=FETCH_INTERVAL_SECS,
+        )
+        parse_task = RSSParserTask(
+            name="rss-parse",
+            tmp_dir=TMP_DIR,
+            log_level="INFO",
+            inbox=parse_inbox,
+            outbox=parse_outbox,
+        )
+        api_task = APIServerTask(
+            name="rss-api",
+            tmp_dir=TMP_DIR,
+            port=API_PORT,
+            log_level="INFO",
+        )
 
-    ok_results = [r for r in fetch_task.results if r.payload.get("ok")]
-    logger.info(
-        "Phase 1 done — %d/%d feeds saved to %s/raw/",
-        len(ok_results), len(fetch_task.results), TMP_DIR,
-    )
+        manager = SchedulerManager(name="rss-live-pipeline", concurrent=True)
+        manager.add(fetch_task)
+        manager.add(parse_task)
+        manager.add(api_task)
 
-    # ── Phase 2 — Parse  (SchedulerProcessTask) ──────────────────────────
-    # File paths from Phase 1 are pre-fed into the process task before
-    # start().  The task runs XML parsing in a dedicated subprocess, then
-    # writes structured JSON to tmp/processed/.
-    logger.info("════ Phase 2 — Parse feeds (ProcessTask) ════")
+        loop = asyncio.get_running_loop()
+        stop_requested = asyncio.Event()
 
-    parse_task = RSSParserTask(
-        name="rss-parse",
-        tmp_dir=TMP_DIR,
-        log_level="INFO",
-    )
-    for result in ok_results:
-        parse_task.feed(
-            Message.data(
-                sender="main",
-                payload={
-                    "filepath": result.payload["filepath"],
-                    "url":      result.payload["url"],
-                },
+        def _request_shutdown(signum: int | None = None) -> None:
+            if stop_requested.is_set():
+                return
+            label = signal.Signals(signum).name if signum is not None else "manual"
+            logger.info("shutdown requested by %s; signalling tasks", label)
+            stop_requested.set()
+            fetch_task.feed(
+                Message.control(sender="main", signal=ControlSignal.STOP)
             )
-        )
-    parse_task.feed(Message.control(sender="main", signal=ControlSignal.STOP))
+            api_task.inbox.put(
+                Message.control(sender="main", signal=ControlSignal.STOP)
+            )
 
-    m2 = SchedulerManager(name="phase2-parse", concurrent=False)
-    m2.add(parse_task)
-    await m2.run_all()
+        registered_signals: list[int] = []
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signum, _request_shutdown, signum)
+                registered_signals.append(signum)
+            except (NotImplementedError, RuntimeError):
+                pass
 
-    total_items = sum(r.payload.get("items", 0) for r in parse_task.results)
-    logger.info(
-        "Phase 2 done — %d feeds parsed, %d total items → %s/processed/",
-        len(parse_task.results), total_items, TMP_DIR,
-    )
-
-    # ── Phase 3 — Serve  (SchedulerThreadTask) ────────────────────────────
-    # FastAPI + uvicorn run in a background daemon thread.  A concurrent
-    # stopper coroutine sends STOP after API_SECS seconds while the main
-    # event loop stays free — proving the thread is fully isolated.
-    logger.info("════ Phase 3 — Serve API (ThreadTask, %d s) ════", API_SECS)
-
-    api_task = APIServerTask(
-        name="rss-api",
-        tmp_dir=TMP_DIR,
-        port=API_PORT,
-        log_level="INFO",
-    )
-    m3 = SchedulerManager(name="phase3-api", concurrent=False)
-    m3.add(api_task)
-
-    async def _stopper() -> None:
         logger.info(
-            "API will serve for %d s — visit http://127.0.0.1:%d",
-            API_SECS, API_PORT,
-        )
-        await asyncio.sleep(API_SECS)
-        logger.info("stopping API server …")
-        api_task.inbox.put(
-            Message.control(sender="main", signal=ControlSignal.STOP)
+            "pipeline running; API at http://127.0.0.1:%d; fetch interval %.1f s",
+            API_PORT,
+            FETCH_INTERVAL_SECS,
         )
 
-    await asyncio.gather(m3.run_all(), _stopper())
-    logger.info("All phases complete.")
+        try:
+            await manager.run_all()
+        except asyncio.CancelledError:
+            _request_shutdown()
+            raise
+        finally:
+            for signum in registered_signals:
+                loop.remove_signal_handler(signum)
 
-    # -- Results -------------------------------------------------------------
-    logger.info("--- async-task results (doubled) ---")
-    for msg in async_task.results:
-        logger.info("  %s", msg.payload)
+        fetch_ok = [r for r in fetch_task.results if (r.payload or {}).get("ok")]
+        fetch_failed = len(fetch_task.results) - len(fetch_ok)
+        parse_results = _drain_message_queue(parse_outbox)
+        total_items = sum(r.payload.get("items", 0) for r in parse_results)
 
-    logger.info("--- thread-task results (tripled) ---")
-    for msg in thread_task.results:
-        logger.info("  %s", msg.payload)
-
-    logger.info("--- process-task results (squared) ---")
-    for msg in process_task.results:
-        logger.info("  %s", msg.payload)
+        logger.info(
+            "Fetch complete: %d ok, %d failed",
+            len(fetch_ok),
+            fetch_failed,
+        )
+        logger.info(
+            "Parse complete: %d feeds parsed, %d total items -> %s/processed/",
+            len(parse_results),
+            total_items,
+            TMP_DIR,
+        )
+        logger.info("All live pipeline tasks complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -194,4 +192,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-

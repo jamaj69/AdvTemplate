@@ -45,7 +45,7 @@ Use this order to regain full context without guessing:
   `TaskConfig`, queue aliases.
 - `examples/example_rss_demo.py`: reference RSS pipeline tasks:
   `RSSFetchTask`, `RSSParserTask`, `APIServerTask`.
-- `main.py`: three-phase RSS pipeline using the RSS demo task classes.
+- `main.py`: live concurrent RSS pipeline using the RSS demo task classes.
 
 ## Execution Strategies
 
@@ -57,8 +57,8 @@ Use this order to regain full context without guessing:
 | Process pool | `SchedulerProcessPoolTask` | `multiprocessing.Manager().Queue()` | persistent `multiprocessing.Process` workers |
 
 `SchedulerManager.run_all()` runs tasks concurrently by default. Use
-`SchedulerManager(..., concurrent=False)` for sequential phases, such as the RSS
-pipeline.
+`SchedulerManager(..., concurrent=False)` only for deliberately batch-style
+examples.
 
 ## Message Lifecycle
 
@@ -81,13 +81,19 @@ one poison pill per worker.
 
 ## RSS Demo
 
-The RSS pipeline is:
+The `main.py` RSS pipeline is:
 
 1. `RSSFetchTask` fetches URLs from `rssfeeds.conf` with `aiohttp` and writes
-   raw XML to `tmp/raw/`.
-2. `RSSParserTask` parses raw XML in a subprocess and writes JSON to
-   `tmp/processed/`.
-3. `APIServerTask` serves parsed data with FastAPI/uvicorn.
+   raw XML to `tmp/raw/` every `RSS_FETCH_INTERVAL_SECS` seconds, streaming each
+   successful file path to a process-safe queue as soon as the fetch completes.
+2. `RSSParserTask` runs at the same time, blocks on that queue, parses raw XML
+   in a subprocess, and writes JSON to `tmp/processed/`.
+3. `APIServerTask` starts with the pipeline and serves parsed data with
+   FastAPI/uvicorn while new processed files appear.
+
+The service runs until `CTRL+C`, `SIGINT`, or `SIGTERM`. Shutdown sends STOP to
+the fetcher and API; the fetcher emits STOP downstream so the parser drains its
+queue and exits cleanly.
 
 Endpoints while the API task is running:
 
@@ -100,9 +106,6 @@ GET /items/{idx}   one item by global index
 
 ## Known Current Edges
 
-- `main.py` has a stale block after the RSS pipeline that references
-  `async_task`, `thread_task`, and `process_task`. Those names belong to
-  `examples/example_all_tasks.py`, not the RSS pipeline.
 - `coordination/__init__.py` does not currently re-export
   `SchedulerProcessPoolTask`, even though the class exists in
   `coordination/scheduler.py`.

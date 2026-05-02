@@ -288,6 +288,7 @@ class SchedulerAsyncTask(SchedulerTask):
         self.inbox:     asyncio.Queue[Message] = inbox     or asyncio.Queue()
         self.outbox:    asyncio.Queue[Message] = outbox    or asyncio.Queue()
         self.log_queue: asyncio.Queue[Message] | None = log_queue
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # -- Log queue emission --------------------------------------------------
 
@@ -316,6 +317,19 @@ class SchedulerAsyncTask(SchedulerTask):
         """Place *msg* on the outbox and log it."""
         self.log("debug", "put_item → %s", msg.kind.value)
         await self.outbox.put(msg)
+
+    def feed(self, msg: Message) -> None:
+        """
+        Place *msg* on the inbox from either the owner loop or another thread.
+
+        Async scheduler tasks run in an isolated event loop on a worker thread.
+        This helper gives external coordinators a thread-safe way to send
+        lifecycle control messages while the task is already running.
+        """
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self.inbox.put_nowait, msg)
+            return
+        self.inbox.put_nowait(msg)
 
     # -- Lifecycle control helpers -------------------------------------------
 
@@ -350,10 +364,16 @@ class SchedulerAsyncTask(SchedulerTask):
         _exc_holder: list[BaseException] = []
 
         def _thread_target() -> None:
+            async def _runner() -> None:
+                self._loop = asyncio.get_running_loop()
+                await self.run()  # type: ignore[misc]
+
             try:
-                asyncio.run(self.run())  # type: ignore[arg-type]
+                asyncio.run(_runner())
             except BaseException as exc:  # noqa: BLE001
                 _exc_holder.append(exc)
+            finally:
+                self._loop = None
 
         t = threading.Thread(target=_thread_target, name=self.name, daemon=True)
         t.start()
@@ -1101,5 +1121,4 @@ class SchedulerManager:
                     self._status = "error"
                     raise task.exception  # type: ignore[misc]
         self._status = "done"
-
 

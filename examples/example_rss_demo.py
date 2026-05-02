@@ -10,10 +10,12 @@ Realistic RSS aggregator pipeline using all three scheduler task types:
 
 Data flow
 ---------
-Phase 1  ``RSSFetchTask`` reads every URL from ``rssfeeds_working.conf``,
-         fetches them **all in parallel** with ``aiohttp``, and saves raw
-         content to ``<tmp_dir>/raw/<hash>.xml``.  One RESULT message per URL
-         flows into ``task.results``.
+Phase 1  ``RSSFetchTask`` reads every URL from ``rssfeeds.conf``, fetches them
+         **all in parallel** with ``aiohttp``, and saves raw content to
+         ``<tmp_dir>/raw/<hash>.xml``.  It can run once or repeat forever every
+         ``interval_seconds``.  One RESULT message per URL flows into
+         ``task.results`` or, when a downstream queue is provided, streams
+         immediately to the next task.
 
 Phase 2  ``RSSParserTask`` runs in a dedicated subprocess.  It receives the
          file paths pre-fed from Phase 1, parses each RSS 2.0 or Atom feed,
@@ -48,6 +50,8 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone
+from contextlib import suppress
+from typing import Any
 
 import aiohttp
 
@@ -57,7 +61,7 @@ from coordination.scheduler import (
     SchedulerProcessTask,
     SchedulerThreadTask,
 )
-from customtypes import ControlSignal, Message
+from customtypes import ControlSignal, Message, MessageKind
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,10 +88,17 @@ class RSSFetchTask(SchedulerAsyncTask):
         feeds_conf: str | Path,
         tmp_dir: str | Path,
         log_level: str = "INFO",
+        *,
+        downstream_queue: Any | None = None,
+        emit_stop: bool = False,
+        interval_seconds: float | None = None,
     ) -> None:
         super().__init__(name, log_level)
         self._feeds_conf = Path(feeds_conf)
         self._raw_dir    = Path(tmp_dir) / "raw"
+        self._downstream_queue = downstream_queue
+        self._emit_stop = emit_stop
+        self._interval_seconds = interval_seconds
 
     async def run(self) -> None:
         self.log("info", "RSSFetchTask started")
@@ -97,37 +108,104 @@ class RSSFetchTask(SchedulerAsyncTask):
             feeds = json.load(fh)
 
         urls = [f["url"] for f in feeds if f.get("url")]
-        self.log("info", "fetching %d feeds concurrently …", len(urls))
+        self.log("info", "loaded %d feed URLs", len(urls))
 
+        try:
+            while True:
+                await self._fetch_cycle(urls)
+                if self._interval_seconds is None:
+                    break
+
+                self.log("info", "next fetch cycle in %.1f s",
+                         self._interval_seconds)
+                signal = await self._wait_for_control_or_timeout(
+                    self._interval_seconds
+                )
+                if signal in {ControlSignal.STOP, ControlSignal.SHUTDOWN}:
+                    self.log("info", "%s received — stopping fetch loop",
+                             signal.value.upper())
+                    break
+                if signal == ControlSignal.PAUSE:
+                    self.log("info", "PAUSE received")
+                    with suppress(asyncio.CancelledError):
+                        await self._wait_for_resume()
+        finally:
+            if self._emit_stop:
+                self._emit_downstream(
+                    Message.control(sender=self.name, signal=ControlSignal.STOP)
+                )
+
+        self.log("info", "RSSFetchTask finished")
+
+    async def _fetch_cycle(self, urls: list[str]) -> None:
+        self.log("info", "fetching %d feeds concurrently …", len(urls))
         connector = aiohttp.TCPConnector(limit=10)
         timeout   = aiohttp.ClientTimeout(total=30)
         headers   = {"User-Agent": "Mozilla/5.0 (compatible; RSSBot/1.0)"}
 
+        ok = failed = 0
         async with aiohttp.ClientSession(
             connector=connector, timeout=timeout, headers=headers
         ) as session:
-            payloads = await asyncio.gather(
-                *(self._fetch_one(session, url) for url in urls),
-                return_exceptions=True,
-            )
+            tasks = [asyncio.create_task(self._fetch_result(session, url))
+                     for url in urls]
+            for completed in asyncio.as_completed(tasks):
+                result = await completed
+                result_msg = Message.result(sender=self.name, payload=result)
+                await self.put_item(result_msg)
 
-        ok = failed = 0
-        for url, result in zip(urls, payloads):
-            if isinstance(result, Exception):
-                self.log("warning", "FAIL  %s — %s", url, result)
-                await self.put_item(
-                    Message.result(
-                        sender=self.name,
-                        payload={"filepath": None, "url": url,
-                                 "ok": False, "error": str(result)},
+                if result.get("ok"):
+                    ok += 1
+                    self._emit_downstream(
+                        Message.data(
+                            sender=self.name,
+                            payload={
+                                "filepath": result["filepath"],
+                                "url":      result["url"],
+                            },
+                        )
                     )
-                )
-                failed += 1
-            else:
-                await self.put_item(Message.result(sender=self.name, payload=result))
-                ok += 1
+                else:
+                    failed += 1
+                    self.log("warning", "FAIL  %s — %s",
+                             result.get("url"), result.get("error", ""))
 
         self.log("info", "fetch complete — ok=%d  failed=%d", ok, failed)
+
+    async def _wait_for_control_or_timeout(
+        self,
+        timeout_seconds: float,
+    ) -> ControlSignal | None:
+        while True:
+            try:
+                msg = await asyncio.wait_for(
+                    self.get_item(),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                return None
+
+            if msg.kind != MessageKind.CONTROL:
+                continue
+            try:
+                return ControlSignal((msg.payload or {}).get("signal"))
+            except ValueError:
+                continue
+
+    async def _fetch_result(self, session: aiohttp.ClientSession, url: str) -> dict:
+        try:
+            result = await self._fetch_one(session, url)
+            result["ok"] = True
+            return result
+        except Exception as exc:
+            return {"filepath": None, "url": url, "ok": False, "error": str(exc)}
+
+    def _emit_downstream(self, msg: Message) -> None:
+        if self._downstream_queue is None:
+            return
+        payload = msg.to_json()
+        put = getattr(self._downstream_queue, "put")
+        put(payload)
 
     async def _fetch_one(self, session: aiohttp.ClientSession, url: str) -> dict:
         ts   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -170,8 +248,13 @@ class RSSParserTask(SchedulerProcessTask):
         name: str,
         tmp_dir: str | Path,
         log_level: str = "INFO",
+        *,
+        inbox=None,
+        outbox=None,
+        log_queue=None,
     ) -> None:
-        super().__init__(name, log_level)
+        super().__init__(name, log_level, inbox=inbox, outbox=outbox,
+                         log_queue=log_queue)
         self._tmp_dir = str(tmp_dir)   # plain str — trivially picklable
 
     # ------------------------------------------------------------------ #
@@ -265,12 +348,11 @@ class RSSParserTask(SchedulerProcessTask):
         # ── main processing loop ─────────────────────────────────────── #
 
         while True:
-            try:
-                msg = self.get_item(timeout=5.0)
-            except Exception:
-                self.log("warning", "inbox timeout — exiting")
-                break
+            msg = self.get_item()
 
+            if self._is_shutdown_signal(msg):
+                self.log("info", "SHUTDOWN received")
+                break
             if self._is_stop_signal(msg):
                 self.log("info", "STOP received")
                 break
@@ -480,7 +562,7 @@ if __name__ == "__main__":
     from examples.example_rss_demo import RSSFetchTask, RSSParserTask, APIServerTask  # noqa: F811
 
     _ROOT      = Path(__file__).resolve().parents[1]
-    _CONF_FILE = _ROOT / "rssfeeds_working.conf"
+    _CONF_FILE = _ROOT / "rssfeeds.conf"
     _TMP_DIR   = _ROOT / "tmp"
     _API_PORT  = 8000
     _API_SECS  = 60

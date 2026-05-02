@@ -51,22 +51,27 @@ cd AdvTemplate
 # (Optional) install deps for the RSS demo
 pip install aiohttp fastapi uvicorn
 
-# Run the RSS aggregator demo
+# Run the live RSS aggregator pipeline
 python main.py
 ```
 
-> Current note: `main.py` still contains a leftover result-printing block from
-> `examples/example_all_tasks.py` after the RSS pipeline completes. Until that
-> block is removed, prefer `python examples/example_rss_demo.py` for the full
-> RSS demo, or run the focused examples below.
+Set `RSS_FETCH_INTERVAL_SECS` to control how often the fetch cycle repeats:
 
-The demo runs a three-phase pipeline:
+```bash
+RSS_FETCH_INTERVAL_SECS=300 python main.py
+```
 
-| Phase | Task | Strategy | What it does |
-|---|---|---|---|
-| 1 | `RSSFetchTask` | `SchedulerAsyncTask` | Fetches all feeds from `rssfeeds.conf` concurrently with `aiohttp`; saves raw XML to `tmp/raw/` |
-| 2 | `RSSParserTask` | `SchedulerProcessTask` | Parses RSS 2.0 / Atom feeds in a subprocess; writes structured JSON to `tmp/processed/` |
-| 3 | `APIServerTask` | `SchedulerThreadTask` | Serves the parsed data via FastAPI on port 8000 for 60 s |
+The service runs until it receives `CTRL+C`, `SIGINT`, or `SIGTERM`. Shutdown is
+graceful: the fetcher finishes its current cycle, sends STOP to the parser, the
+parser drains queued items, and the API stops on its control message.
+
+The demo starts all three RSS tasks together and connects them with queues:
+
+| Task | Strategy | What it does |
+|---|---|---|
+| `RSSFetchTask` | `SchedulerAsyncTask` | Every `RSS_FETCH_INTERVAL_SECS`, fetches all feeds from `rssfeeds.conf` concurrently with `aiohttp`; streams successful file paths to the parser queue |
+| `RSSParserTask` | `SchedulerProcessTask` | Blocks on a process-safe queue, parses RSS 2.0 / Atom feeds in a subprocess, and writes structured JSON to `tmp/processed/` |
+| `APIServerTask` | `SchedulerThreadTask` | Serves `tmp/processed/*.json` via FastAPI on port 8000 while fetch and parse are still running |
 
 **API endpoints** (while Phase 3 is running):
 
@@ -83,7 +88,7 @@ GET /items/{idx}   → single item by 0-based global index
 
 ```
 AdvTemplate/
-├── main.py                        # Entry point — three-phase RSS pipeline
+├── main.py                        # Entry point — live concurrent RSS pipeline
 ├── customtypes.py                 # Shared types & message protocol
 ├── rssfeeds.conf                  # JSON array of RSS feed URLs
 ├── coordination/
@@ -115,7 +120,7 @@ python examples/example_all_tasks.py
 # Persistent process-pool demo (no external deps)
 python examples/example_process_pool.py
 
-# RSS aggregator pipeline (requires aiohttp + fastapi + uvicorn)
+# RSS aggregator examples (requires aiohttp + fastapi + uvicorn)
 python examples/example_rss_demo.py
 # or simply:
 python main.py
